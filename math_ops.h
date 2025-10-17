@@ -20,11 +20,12 @@ void matrix_add(Matrix *a, Matrix *b, Matrix *result);
 void matmul(Matrix *a, Matrix *b, Matrix *result);
 void matrix_scale(Matrix *m, float scalarValue);
 void matrix_transpose(Matrix *m, Matrix *result);
-
+void matrix_sum_rows(Matrix *m, Matrix *result);
 // Activation and normalization
 void GELU(Matrix *matrix);
 void softmax(float *input, float *output, int length);
 void mat_softmax_rows(Matrix *m);
+void softmax_derivative(float *softmax_output, float *grad_output, float *grad_input, int length);
 void layer_normalize(float *input, float *output, float *gain, float *bias, int length);
 
 // Utility functions

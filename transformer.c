@@ -5,6 +5,38 @@
 #include "math_ops.h"
 #include "transformer.h"
 #include <time.h>
+typedef struct
+{
+  Matrix *result;
+  Matrix *score;
+} AttentionOutput;
+
+typedef struct
+{
+  Matrix *result; // The final output
+
+  // For backprop through final matmul
+  Matrix *concat_result; // Concatenated head outputs
+
+  // For backprop through each head
+  Matrix **head_outputs; // Output of each attention head
+  Matrix **head_scores;  // Attention scores (post-softmax) for each head
+
+  // For backprop through slicing
+  Matrix **Q_heads; // Q split into heads
+  Matrix **K_heads; // K split into heads
+  Matrix **V_heads; // V split into heads
+
+  // For backprop through initial projections
+  Matrix *Q; // Q = input @ W_Q
+  Matrix *K; // K = input @ W_K
+  Matrix *V; // V = input @ W_V
+
+  // Metadata
+  int num_of_heads; // Number of attention heads
+  int head_dim;     // Dimension per head
+} MultiHeadAttentionCache;
+
 char *load_text_file(char *filepath, int *output_length)
 {
   FILE *file = fopen(filepath, "r");
@@ -227,7 +259,7 @@ Matrix *attention(Matrix *Q, Matrix *K, Matrix *V)
   matrix_free(scores);
   return result;
 }
-Matrix *masked_attention(Matrix *Q, Matrix *K, Matrix *V)
+AttentionOutput masked_attention(Matrix *Q, Matrix *K, Matrix *V)
 {
   Matrix *T = matrix_alloc(K->cols, K->rows);
   matrix_transpose(K, T);
@@ -261,21 +293,163 @@ Matrix *masked_attention(Matrix *Q, Matrix *K, Matrix *V)
   Matrix *result = matrix_alloc(Q->rows, V->cols);
   matmul(scores, V, result);
   matrix_free(T);
-  matrix_free(scores);
-  return result;
+  AttentionOutput output;
+  output.result = result;
+  output.score = scores;
+  return output;
 }
-
+void masked_attention_backward(
+    Matrix *d_result, // gradient flowing back from next layer
+    Matrix *Q,        // stored from forward pass
+    Matrix *K,        // stored from forward pass
+    Matrix *V,        // stored from forward pass
+    Matrix *scores,   // stored attention scores (post-softmax) from forward
+    Matrix *d_Q,      // output: gradient w.r.t. Q
+    Matrix *d_K,      // output: gradient w.r.t. K
+    Matrix *d_V       // output: gradient w.r.t. V
+)
+{
+  Matrix *transposed_V = matrix_alloc(V->cols, V->rows);
+  matrix_transpose(V, transposed_V);
+  Matrix *d_scores = matrix_alloc(Q->rows, K->rows);
+  matmul(d_result, transposed_V, d_scores);
+  Matrix *transposed_scores = matrix_alloc(scores->cols, scores->rows);
+  matrix_transpose(scores, transposed_scores);
+  matmul(transposed_scores, d_result, d_V);
+  matrix_free(transposed_scores);
+  Matrix *d_scores_pre_softmax = matrix_alloc(scores->rows, scores->cols);
+  for (int i = 0; i < scores->rows; i++)
+  {
+    float sum = 0.0;
+    for (int k = 0; k < scores->cols; k++)
+    {
+      sum += d_scores->data[i * d_scores->cols + k] * scores->data[i * scores->cols + k];
+    }
+    for (int j = 0; j < scores->cols; j++)
+    {
+      d_scores_pre_softmax->data[i * d_scores_pre_softmax->cols + j] = scores->data[i * scores->cols + j] * (d_scores->data[i * d_scores->cols + j] - sum);
+    }
+  }
+  for (int row = 0; row < d_scores_pre_softmax->rows; row++)
+  {
+    for (int col = 0; col < d_scores_pre_softmax->cols; col++)
+    {
+      if (col > row)
+      {
+        d_scores_pre_softmax->data[row * d_scores_pre_softmax->cols + col] = 0.0f;
+      }
+    }
+  }
+  for (int row = 0; row < d_scores_pre_softmax->rows; row++)
+  {
+    for (int col = 0; col < d_scores_pre_softmax->cols; col++)
+    {
+      d_scores_pre_softmax->data[row * d_scores_pre_softmax->cols + col] = d_scores_pre_softmax->data[row * d_scores_pre_softmax->cols + col] / sqrt(Q->cols);
+    }
+  }
+  matmul(d_scores_pre_softmax, K, d_Q);
+  Matrix *d_scores_pre_softmax_T = matrix_alloc(d_scores_pre_softmax->cols, d_scores_pre_softmax->rows);
+  matrix_transpose(d_scores_pre_softmax, d_scores_pre_softmax_T);
+  matmul(d_scores_pre_softmax_T, Q, d_K);
+  matrix_free(transposed_V);
+  matrix_free(d_scores);
+  matrix_free(d_scores_pre_softmax);
+  matrix_free(d_scores_pre_softmax_T);
+};
 void write_data_to_matrix(float *data, Matrix *output)
 {
   for (int i = 0; i < output->rows; i++)
   {
     for (int j = 0; j < output->cols; j++)
     {
-      output->data[i * output->cols + j] = data[i * output->cols + j];
+      if (j > i)
+      {
+        output->data[i * output->cols + j] = data[i * output->cols + j];
+      }
     }
   }
 }
-Matrix *multi_head_masked_attention(Matrix *input, Matrix *W_Q, Matrix *W_K, Matrix *W_V, Matrix *W_0, int num_of_heads)
+float train_step(
+    // Input data
+    int *input_tokens,  // The input sequence
+    int *target_tokens, // What the model should predict
+    int seq_len,        // Length of sequences
+
+    // Model architecture params
+    int num_layers,
+    int num_heads,
+    int d_model,
+    int vocab_size,
+
+    // All the model weights (these will be updated)
+    Matrix *embedding_table,
+    Matrix **W_Q_layers,
+    Matrix **W_K_layers,
+    Matrix **W_V_layers,
+    Matrix **W_O_layers,
+    Matrix **W1_layers,
+    Matrix **b1_layers,
+    Matrix **W2_layers,
+    Matrix **b2_layers,
+    float **ln1_gain_layers,
+    float **ln1_bias_layers,
+    float **ln2_gain_layers,
+    float **ln2_bias_layers,
+    Matrix *W_out,
+    Matrix *b_out,
+
+    // Training hyperparameter
+    float learning_rate)
+{
+  // Convert tokens to embeddings
+  Matrix *input_embeddings = embed_tokens(input_tokens, seq_len, embedding_table);
+
+  // Add positional encoding
+  add_positional_encoding(input_embeddings, seq_len, d_model);
+
+  // Run through decoder
+  Matrix *decoder_output = matrix_alloc(seq_len, d_model);
+  decoder(input_embeddings,
+          W_Q_layers, W_K_layers, W_V_layers, W_O_layers,
+          W1_layers, b1_layers, W2_layers, b2_layers,
+          ln1_gain_layers, ln1_bias_layers, ln2_gain_layers, ln2_bias_layers,
+          num_layers, num_heads,
+          decoder_output);
+
+  // Project to vocabulary
+  Matrix *logits = output_projection(decoder_output, W_out, b_out);
+  Matrix *dLogits = matrix_alloc(logits->rows, logits->cols);
+  mat_softmax_rows(logits);
+
+  // Compute loss
+  float loss = cross_entropy_loss(logits, target_tokens, seq_len, vocab_size);
+  for (int i = 0; i < logits->rows; i++)
+  {
+    float correct_token = target_tokens[i];
+    for (int j = 0; j < logits->cols; j++)
+    {
+      dLogits->data[i * dLogits->cols + j] = logits->data[i * logits->cols + j];
+
+      if (j == correct_token)
+      {
+        dLogits->data[i * dLogits->cols + j] -= 1.0;
+      }
+    }
+  }
+  Matrix *decoder_output_T = matrix_alloc(decoder_output->cols, decoder_output->rows);
+  matrix_transpose(decoder_output, decoder_output_T);
+  Matrix *dW_out = matrix_alloc(W_out->rows, W_out->cols);
+  matmul(decoder_output_T, dLogits, dW_out);
+  Matrix *dB_out = matrix_alloc(b_out->rows, b_out->cols);
+  matrix_sum_rows(dLogits, dB_out);
+
+  Matrix *dDecoder_output_T = matrix_alloc(W_out->cols, W_out->rows);
+  matrix_transpose(W_out, dDecoder_output_T);
+  Matrix *dDecoder_output = matrix_alloc(dDecoder_output_T->rows, dDecoder_output_T->cols);
+  matmul(dLogits, dDecoder_output_T, dDecoder_output);
+};
+
+MultiHeadAttentionCache multi_head_masked_attention(Matrix *input, Matrix *W_Q, Matrix *W_K, Matrix *W_V, Matrix *W_0, int num_of_heads)
 {
   Matrix *Q = matrix_alloc(input->rows, W_Q->cols);
   Matrix *K = matrix_alloc(input->rows, W_K->cols);
@@ -303,11 +477,14 @@ Matrix *multi_head_masked_attention(Matrix *input, Matrix *W_Q, Matrix *W_K, Mat
   }
   Matrix *concat_result = matrix_alloc(input->rows, W_V->cols);
   Matrix **head_outputs = malloc(num_of_heads * sizeof(Matrix));
+  Matrix **head_scores = malloc(num_of_heads * sizeof(Matrix *)); // STORE THESE!
 
   int index = 0;
   for (int i = 0; i < num_of_heads; i++)
   {
-    head_outputs[i] = masked_attention(Q_heads[i], K_heads[i], V_heads[i]);
+    AttentionOutput attn_out = masked_attention(Q_heads[i], K_heads[i], V_heads[i]);
+    head_outputs[i] = attn_out.result;
+    head_scores[i] = attn_out.score;
   }
   for (int row = 0; row < input->rows; row++)
   {
@@ -332,27 +509,241 @@ Matrix *multi_head_masked_attention(Matrix *input, Matrix *W_Q, Matrix *W_K, Mat
     matrix_free(K_heads[i]);
     matrix_free(V_heads[i]);
   }
-  free(Q_heads);
-  free(K_heads);
-  free(V_heads);
-  matrix_free(Q);
-  matrix_free(K);
-  matrix_free(V);
-  free(head_outputs);
-  matrix_free(concat_result);
-  return final_result;
+  MultiHeadAttentionCache cache;
+  cache.concat_result = concat_result;
+  cache.head_dim = head_dim;
+  cache.head_outputs = head_outputs;
+  cache.head_scores = head_scores;
+  cache.K = K;
+  cache.Q = Q;
+  cache.V = V;
+
+  cache.num_of_heads = num_of_heads;
+  cache.Q_heads = Q_heads;
+  cache.result = final_result;
+  cache.V_heads = V_heads;
+
+  return cache;
+}
+void multi_head_masked_attention_backward(
+    Matrix *d_final_result, // gradient flowing back from next layer
+    Matrix *input,          // original input (from forward)
+    Matrix *W_Q,            // weight matrices (from forward)
+    Matrix *W_K,
+    Matrix *W_V,
+    Matrix *W_0,
+    MultiHeadAttentionCache *cache, // all the stored activations from forward
+    Matrix *d_input,                // output: gradient w.r.t. input
+    Matrix *d_W_Q,                  // output: gradient w.r.t. W_Q
+    Matrix *d_W_K,                  // output: gradient w.r.t. W_K
+    Matrix *d_W_V,                  // output: gradient w.r.t. W_V
+    Matrix *d_W_0                   // output: gradient w.r.t. W_0
+)
+{
+  Matrix *Q = cache->Q;
+  Matrix *K = cache->K;
+  Matrix *V = cache->V;
+  int head_dim = Q->cols / cache->num_of_heads;
+  Matrix **Q_heads = cache->Q_heads;
+  Matrix **K_heads = cache->K_heads;
+  Matrix **V_heads = cache->V_heads;
+
+  Matrix *W_0_T = matrix_alloc(W_0->cols, W_0->rows);
+  Matrix *concat_result_T = matrix_alloc(cache->concat_result->cols, cache->concat_result->rows);
+  matrix_transpose(W_0, W_0_T);
+  matrix_transpose(cache->concat_result, concat_result_T);
+  Matrix *d_concat_result = matrix_alloc(cache->concat_result->rows, cache->concat_result->cols);
+  matmul(d_final_result, W_0_T, d_concat_result);
+  matmul(concat_result_T, d_concat_result, d_W_0);
+  Matrix **d_head_outputs = malloc(cache->num_of_heads * sizeof(Matrix *));
+  for (int i = 0; i < cache->num_of_heads; i++)
+  {
+    d_head_outputs[i] = matrix_alloc(input->rows, head_dim);
+  }
+  for (int row = 0; row < d_concat_result->rows; row++)
+  {
+    for (int h = 0; h < cache->num_of_heads; h++)
+    {
+
+      for (int col = 0; col < head_dim; col++)
+      {
+        int concat_col = h * head_dim + col;
+        d_head_outputs[h]->data[row * head_dim + col] = d_concat_result->data[row * cache->concat_result->cols + concat_col];
+      }
+    }
+  }
+  Matrix **d_Q_heads = malloc(cache->num_of_heads * sizeof(Matrix *));
+  if (d_Q_heads == NULL)
+  {
+    printf("Could not allocate memory for D Q Heads");
+    exit(1);
+  }
+  Matrix **d_K_heads = malloc(cache->num_of_heads * sizeof(Matrix *));
+  if (d_K_heads == NULL)
+  {
+    free(d_Q_heads);
+    printf("Could not allocate memory for D K Heads");
+    exit(1);
+  }
+  Matrix **d_V_heads = malloc(cache->num_of_heads * sizeof(Matrix *));
+  if (d_V_heads == NULL)
+  {
+    free(d_Q_heads);
+    free(d_K_heads);
+    printf("Could not allocate memory for D V Heads");
+    exit(1);
+  }
+  for (int i = 0; i < cache->num_of_heads; i++)
+  {
+    d_Q_heads[i] = matrix_alloc(Q_heads[i]->rows, Q_heads[i]->cols);
+    d_K_heads[i] = matrix_alloc(K_heads[i]->rows, K_heads[i]->cols);
+    d_V_heads[i] = matrix_alloc(V_heads[i]->rows, V_heads[i]->cols);
+  }
+  for (int i = 0; i < cache->num_of_heads; i++)
+  {
+    masked_attention_backward(d_head_outputs[i], Q_heads[i], K_heads[i], V_heads[i], cache->head_scores[i], d_Q_heads[i], d_K_heads[i], d_V_heads[i]);
+  }
+  Matrix *d_Q = matrix_alloc(Q->rows, Q->cols);
+  Matrix *d_K = matrix_alloc(K->rows, K->cols);
+  Matrix *d_V = matrix_alloc(V->rows, V->cols);
+  for (int h = 0; h < cache->num_of_heads; h++)
+  {
+    for (int row = 0; row < d_Q_heads[h]->rows; row++)
+    {
+      for (int col = 0; col < d_Q_heads[h]->cols; col++)
+      {
+        d_Q->data[row * d_Q->cols + h * head_dim + col] = d_Q_heads[h]->data[row * head_dim + col];
+      }
+    }
+  }
+  for (int h = 0; h < cache->num_of_heads; h++)
+  {
+    for (int row = 0; row < d_K_heads[h]->rows; row++)
+    {
+      for (int col = 0; col < d_K_heads[h]->cols; col++)
+      {
+        d_K->data[row * d_K->cols + h * head_dim + col] = d_K_heads[h]->data[row * head_dim + col];
+      }
+    }
+  }
+  for (int h = 0; h < cache->num_of_heads; h++)
+  {
+    for (int row = 0; row < d_V_heads[h]->rows; row++)
+    {
+      for (int col = 0; col < d_V_heads[h]->cols; col++)
+      {
+        d_V->data[row * d_V->cols + h * head_dim + col] = d_V_heads[h]->data[row * head_dim + col];
+      }
+    }
+  }
+  Matrix *d_input_from_Q = matrix_alloc(input->rows, input->cols);
+  Matrix *d_input_from_K = matrix_alloc(input->rows, input->cols);
+  Matrix *d_input_from_V = matrix_alloc(input->rows, input->cols);
+  Matrix *W_Q_T = matrix_alloc(W_Q->cols, W_Q->rows);
+  Matrix *W_K_T = matrix_alloc(W_K->cols, W_K->rows);
+  Matrix *W_V_T = matrix_alloc(W_V->cols, W_V->rows);
+  matrix_transpose(W_Q, W_Q_T);
+  matrix_transpose(W_K, W_K_T);
+  matrix_transpose(W_V, W_V_T);
+  matmul(d_Q, W_Q_T, d_input_from_Q);
+  matmul(d_K, W_K_T, d_input_from_K);
+  matmul(d_V, W_V_T, d_input_from_V);
+  for (int i = 0; i < input->rows; i++)
+  {
+    for (int j = 0; j < input->cols; j++)
+    {
+      int idx = i * input->cols + j;
+      d_input->data[idx] = d_input_from_Q->data[idx] + d_input_from_K->data[idx] + d_input_from_V->data[idx];
+    }
+  }
+  Matrix *input_T = matrix_alloc(input->cols, input->rows);
+  for (int i = 0; i < cache->num_of_heads; i++)
+  {
+    matrix_free(d_Q_heads[i]);
+    matrix_free(d_V_heads[i]);
+    matrix_free(d_K_heads[i]);
+  }
+  matrix_transpose(input, input_T);
+  matmul(input_T, d_Q, d_W_Q);
+  matmul(input_T, d_K, d_W_K);
+  matmul(input_T, d_V, d_W_V);
+  matrix_free(d_input_from_Q);
+  matrix_free(d_input_from_K);
+  matrix_free(d_input_from_V);
+  matrix_free(concat_result_T);
+  matrix_free(d_concat_result);
+  matrix_free(W_Q_T);
+  matrix_free(W_K_T);
+  matrix_free(W_V_T);
+  matrix_free(W_0_T);
+  matrix_free(d_Q);
+  matrix_free(d_K);
+  matrix_free(d_V);
+  free(d_Q_heads);
+  free(d_K_heads);
+  free(d_V_heads);
+
+  for (int i = 0; i < cache->num_of_heads; i++)
+  {
+    matrix_free(d_head_outputs[i]);
+  }
+  free(d_head_outputs);
+}
+void decoder_layer_backward(
+    Matrix *dOutput,
+
+    Matrix *decoder_input,
+    Matrix *W_Q_self,
+    Matrix *W_K_self,
+    Matrix *W_V_self,
+    Matrix *W_O_self,
+    int num_heads,
+    Matrix *W1,
+    Matrix *b1,
+    Matrix *W2,
+    Matrix *b2,
+    float *ln1_gain,
+    float *ln1_bias,
+    float *ln2_gain,
+    float *ln2_bias,
+
+    // Saved activations from forward pass (you need to save these!)
+    Matrix *self_attention_output,
+    Matrix *residual_1,
+    Matrix *norm1,
+    Matrix *feed_forward_result,
+    Matrix *residual_2,
+
+    // Output: gradient to pass backward
+    Matrix *dInput,
+
+    // Output: gradients for all weights in this layer
+    Matrix *dW_Q_self,
+    Matrix *dW_K_self,
+    Matrix *dW_V_self,
+    Matrix *dW_O_self,
+    Matrix *dW1,
+    Matrix *dB1,
+    Matrix *dW2,
+    Matrix *dB2,
+    float *dLn1_gain,
+    float *dLn1_bias,
+    float *dLn2_gain,
+    float *dLn2_bias)
+{
 }
 
 void decoder_layer(
     Matrix *decoder_input,
-    Matrix *encoder_output,
     Matrix *W_Q_self, Matrix *W_K_self, Matrix *W_V_self, Matrix *W_O_self,
-    Matrix *W_Q_cross, Matrix *W_K_cross, Matrix *W_V_cross, Matrix *W_O_cross,
     int num_heads,
     Matrix *W1, Matrix *b1, Matrix *W2, Matrix *b2,
-    float *ln1_gain, float *ln1_bias, float *ln2_gain, float *ln2_bias, float *ln3_gain, float *ln3_bias, Matrix *output)
+    float *ln1_gain, float *ln1_bias,
+    float *ln2_gain, float *ln2_bias, // Renamed from ln3
+    Matrix *output)
 {
-  Matrix *self_attention_output = multi_head_masked_attention(decoder_input, W_Q_self, W_K_self, W_V_self, W_O_self, num_heads);
+  MultiHeadAttentionCache cache = multi_head_masked_attention(decoder_input, W_Q_self, W_K_self, W_V_self, W_O_self, num_heads);
+  Matrix *self_attention_output = cache.result;
   Matrix *residual_1 = matrix_alloc(decoder_input->rows, decoder_input->cols);
   matrix_add(self_attention_output, decoder_input, residual_1);
 
@@ -380,38 +771,12 @@ void decoder_layer(
   {
     norm1->data[i] = normalised_rows_for_self_attention_output[i];
   }
-  Matrix *cross_attention_output = multi_head_cross_attention(norm1, encoder_output, W_Q_cross, W_K_cross, W_V_cross, W_O_cross, num_heads);
-  Matrix *residual_2 = matrix_alloc(decoder_input->rows, decoder_input->cols);
-
-  matrix_add(cross_attention_output, norm1, residual_2);
-  float *normalised_rows_for_cross_attention_output = malloc(residual_2->capacity * sizeof(float));
-
-  for (int i = 0; i < self_attention_output->rows; i++)
-  {
-    int start_index = i * residual_2->cols;
-    int end_index = start_index + residual_2->cols;
-    float *layer = get_row(residual_2->data, start_index, end_index);
-    float *normalised_row = malloc((end_index - start_index) * sizeof(float));
-    layer_normalize(layer, normalised_row, ln2_gain, ln2_bias, residual_2->cols);
-
-    for (int j = 0; j < (end_index - start_index); j++)
-    {
-      normalised_rows_for_cross_attention_output[start_index + j] = normalised_row[j];
-    }
-    free(normalised_row);
-    free(layer);
-  }
-  Matrix *norm2 = matrix_alloc(decoder_input->rows, decoder_input->cols);
-  for (int i = 0; i < norm1->capacity; i++)
-  {
-    norm2->data[i] = normalised_rows_for_cross_attention_output[i];
-  }
 
   Matrix *feed_forward_result = matrix_alloc(decoder_input->rows, decoder_input->cols);
 
-  feed_forward(norm2, W1, b1, W2, b2, feed_forward_result);
+  feed_forward(norm1, W1, b1, W2, b2, feed_forward_result);
   Matrix *residual_3 = matrix_alloc(decoder_input->rows, decoder_input->cols);
-  matrix_add(feed_forward_result, norm2, residual_3);
+  matrix_add(feed_forward_result, norm1, residual_3);
   float *normalised_rows_for_feed_forward_output = malloc(residual_3->capacity * sizeof(float));
   for (int i = 0; i < self_attention_output->rows; i++)
   {
@@ -419,7 +784,7 @@ void decoder_layer(
     int end_index = start_index + residual_3->cols;
     float *layer = get_row(residual_3->data, start_index, end_index);
     float *normalised_row = malloc((end_index - start_index) * sizeof(float));
-    layer_normalize(layer, normalised_row, ln3_gain, ln3_bias, residual_3->cols);
+    layer_normalize(layer, normalised_row, ln2_gain, ln2_bias, residual_3->cols);
 
     for (int j = 0; j < (end_index - start_index); j++)
     {
@@ -435,30 +800,19 @@ void decoder_layer(
   free(normalised_rows_for_feed_forward_output);
   matrix_free(residual_1);
   matrix_free(norm1);
-  matrix_free(residual_2);
-  matrix_free(norm2);
   matrix_free(feed_forward_result);
   matrix_free(residual_3);
   matrix_free(self_attention_output);
-  matrix_free(cross_attention_output);
   free(normalised_rows_for_self_attention_output);
-  free(normalised_rows_for_cross_attention_output);
 }
-void decoder(
-    Matrix *decoder_input,  // Target sequence embeddings (with positional encoding)
-    Matrix *encoder_output, // Output from the encoder stack
 
+void decoder(
+    Matrix *decoder_input, // Target sequence embeddings (with positional encoding)
     // Self-attention weights (masked) for each layer
     Matrix **W_Q_self_layers,
     Matrix **W_K_self_layers,
     Matrix **W_V_self_layers,
     Matrix **W_O_self_layers,
-
-    // Cross-attention weights for each layer
-    Matrix **W_Q_cross_layers,
-    Matrix **W_K_cross_layers,
-    Matrix **W_V_cross_layers,
-    Matrix **W_O_cross_layers,
 
     // Feed-forward weights for each layer
     Matrix **W1_layers,
@@ -466,13 +820,10 @@ void decoder(
     Matrix **W2_layers,
     Matrix **b2_layers,
 
-    // Layer norm parameters (3 per layer now!)
     float **ln1_gain_layers, // After masked self-attention
     float **ln1_bias_layers,
-    float **ln2_gain_layers, // After cross-attention
+    float **ln2_gain_layers, // After feed-forward (renamed from ln3)
     float **ln2_bias_layers,
-    float **ln3_gain_layers, // After feed-forward
-    float **ln3_bias_layers,
 
     int num_layers, // Number of decoder layers (6 in paper)
     int num_heads,  // Number of attention heads
@@ -485,9 +836,12 @@ void decoder(
   {
     Matrix *next_output = matrix_alloc(decoder_input->rows, decoder_input->cols);
     decoder_layer(current,
-                  encoder_output,
-                  W_Q_self_layers[i], W_K_self_layers[i], W_V_self_layers[i], W_O_self_layers[i], W_Q_cross_layers[i], W_K_cross_layers[i], W_V_cross_layers[i], W_O_cross_layers[i], num_heads, W1_layers[i], b1_layers[i], W2_layers[i], b2_layers[i], ln1_gain_layers[i], ln1_bias_layers[i], ln2_gain_layers[i], ln2_bias_layers[i], ln3_gain_layers[i], ln3_bias_layers[i], next_output);
-
+                  W_Q_self_layers[i], W_K_self_layers[i], W_V_self_layers[i], W_O_self_layers[i],
+                  num_heads,
+                  W1_layers[i], b1_layers[i], W2_layers[i], b2_layers[i],
+                  ln1_gain_layers[i], ln1_bias_layers[i],
+                  ln2_gain_layers[i], ln2_bias_layers[i], // Changed from ln3
+                  next_output);
     if (i > 0)
     {
       matrix_free(current);
@@ -668,12 +1022,10 @@ Matrix *embed_tokens(int *token_ids, int seq_len, Matrix *embedding_table)
   Matrix *matrix = matrix_alloc(seq_len, embedding_table->cols);
   for (int row = 0; row < seq_len; row++)
   {
-
     int token_id = token_ids[row];
-    int start_index = row * embedding_table->cols;
     for (int col = 0; col < embedding_table->cols; col++)
     {
-      matrix->data[start_index + col] = embedding_table->data[token_id * embedding_table->cols + col];
+      matrix->data[row * embedding_table->cols + col] = embedding_table->data[token_id * embedding_table->cols + col];
     }
   }
   return matrix;

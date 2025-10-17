@@ -4,6 +4,7 @@
 #include "math_ops.h"
 
 #define MASK_VALUE -INFINITY
+#define SQRT_2_OVER_PI 0.7978845608
 
 typedef struct
 {
@@ -79,7 +80,76 @@ void matmul(Matrix *a, Matrix *b, Matrix *result)
     }
   }
 }
-
+void matrix_subtract(Matrix *a, Matrix *b, Matrix *result)
+{
+  for (int i = 0; i < a->capacity; i++)
+  {
+    result->data[i] = a->data[i] - b->data[i];
+  }
+}
+void matrix_copy(Matrix *src, Matrix *dest)
+{
+  for (int i = 0; i < src->capacity; i++)
+  {
+    dest->data[i] = src->data[i];
+  }
+}
+void matrix_hadamard(Matrix *a, Matrix *b, Matrix *result)
+{
+  for (int i = 0; i < result->capacity; i++)
+  {
+    result->data[i] = a->data[i] * b->data[i];
+  }
+};
+void matrix_sum_rows(Matrix *m, Matrix *result)
+{
+  for (int i = 0; i < m->rows; i++)
+  {
+    result->data[i] = 0.0;
+  }
+  for (int row = 0; row < m->rows; row++)
+  {
+    for (int col = 0; col < m->cols; col++)
+    {
+      result->data[col] += m->data[row * m->cols + col];
+    }
+  }
+};
+void GELU_derivative(Matrix *input, Matrix *output)
+{
+  float π = 3.14159265359;
+  for (int i = 0; i < input->capacity; i++)
+  {
+    float x = input->data[i];
+    float z = SQRT_2_OVER_PI * (x + 0.044715 * x * x * x);
+    float tanh_z = tanh(z);
+    float sech_squared = 1 - tanh_z * tanh_z;
+    float dz_dx = SQRT_2_OVER_PI * (1 + 0.134145 * x * x);
+    float derivative = 0.5 * (1 + tanh_z) + 0.5 * x * sech_squared * dz_dx;
+    output->data[i] = derivative;
+  }
+};
+void softmax_derivative(float *softmax_output, float *grad_output, float *grad_input, int length)
+{
+  for (int i = 0; i < length; i++)
+  {
+    grad_input[i] = 0.0;
+    for (int j = 0; j < length; j++)
+    {
+      if (i == j)
+      {
+        grad_input[i] += softmax_output[i] * (1 - softmax_output[i]) * grad_output[j];
+      }
+      else
+      {
+        grad_input[i] += -softmax_output[i] * softmax_output[j] * grad_output[j];
+      }
+    }
+  }
+};
+// Given softmax output and gradient flowing back, compute gradient to input
+// Computes derivative of GELU at each point
+// You already have GELU, now you need d(GELU)/dx
 void matrix_scale(Matrix *m, float scalarValue)
 {
   for (int i = 0; i < m->capacity; i++)
@@ -172,11 +242,10 @@ float *slice_array(float *data, int start_index, int end_index, int number_of_ro
 }
 void GELU(Matrix *matrix)
 {
-  float sqrt_2_over_pi = 0.7978845608;
   for (int i = 0; i < matrix->capacity; i++)
   {
     float x = matrix->data[i];
-    matrix->data[i] = x * 0.5 * (1 + tanh(sqrt_2_over_pi * (x + 0.044715 * (x * x * x))));
+    matrix->data[i] = x * 0.5 * (1 + tanh(SQRT_2_OVER_PI * (x + 0.044715 * (x * x * x))));
   }
 }
 void add_bias(Matrix *matrix, Matrix *bais, Matrix *result)

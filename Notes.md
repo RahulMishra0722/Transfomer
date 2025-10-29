@@ -425,6 +425,519 @@ Create a function that:
 
 Now your transformer can finally understand that word order matters!
 
-```
+# Understanding Attention Mechanisms: My Journey
+
+## Table of Contents
+
+1. [The Initial Confusion](#the-initial-confusion)
+2. [The Big Realization](#the-big-realization)
+3. [Direction vs Magnitude](#direction-vs-magnitude)
+4. [How Learning Actually Works](#how-learning-actually-works)
+5. [Understanding Q, K, V Matrices](#understanding-q-k-v-matrices)
+6. [Why Scaling Matters](#why-scaling-matters)
+7. [Multi-Head Attention](#multi-head-attention)
+
+---
+
+## The Initial Confusion
+
+I always thought: **What the fuck are these Q, K, V matrices for?**
+
+As someone who doesn't take anything as default, I cannot accept something until I intuitively see why it is the way it is. It was always strange to me:
+
+- Why Q, K, V and not just 1 matrix?
+- Why not Q, K, V, Z?
+
+### The Realization
+
+Then it hit me: **They just tried a bunch of stuff and Q, K, V happened to work best.**
+
+I do experiments the same way - throw stuff together, keep what works, toss what doesn't. That's how research actually works!
+
+> **Key Insight:** There's no secret mathematical proof. No divine insight. Just empirical results.
+
+If A1, B2 worked better, we'd be using that instead. If just Q alone worked better, we'd use that. The fact that we use Q, K, V means people experimented and this configuration got the best results. That's it. No magic!
+
+---
+
+## Direction vs Magnitude
+
+### The Misleading Example
+
+When I first learned about attention, I was given this example:
+
+**Example 1:** Similar vectors
 
 ```
+A = [1, 2, 3]
+B = [1, 2, 3]
+Dot product = 14 (HIGH!)
+```
+
+**Example 2:** Different vectors
+
+```
+A = [1, 2, 3]
+C = [0, 0, 0]
+Dot product = 0 (LOW!)
+```
+
+**Conclusion shown:** "Similar vectors → HIGH dot product, Different vectors → LOW dot product"
+
+### Why This Example Is Terrible
+
+The `[0, 0, 0]` example created **three false impressions:**
+
+1. ❌ Bigger numbers = more attention (because 14 > 0)
+2. ❌ Only extreme cases matter (perfect match vs nothing)
+3. ❌ Magnitude is what we're measuring (louder = more attention)
+
+**All three are WRONG.**
+
+### My Confusion
+
+I kept thinking: "What if C = [30, 12, 15]?"
+
+- That's way bigger than A = [1, 2, 3]
+- Even after normalization, the ratios stay different
+- So does bigger mean more attention or not?
+
+The example made me think **magnitude = similarity**, which is backwards.
+
+### What Actually Matters: Direction
+
+```
+A = [1, 2, 3]
+B = [2, 4, 6]      // Same direction as A, just scaled up!
+C = [3, 1, 2]      // Different direction
+
+After normalization:
+A_norm = [0.27, 0.53, 0.80]
+B_norm = [0.27, 0.53, 0.80]  ← Identical to A!
+C_norm = [0.65, 0.22, 0.43]  ← Actually different
+```
+
+See how C has different proportions? Vectors in the same direction (A and B) become identical after normalization.
+
+### Attention Scores
+
+- **A → B: HIGH** (same direction = pay more attention)
+- **A → C: LOWER** (different direction = pay less attention)
+
+> **The Real Insight:** Attention measures DIRECTION similarity (semantic meaning), not MAGNITUDE (loudness).
+
+### The Complete Picture
+
+**It's both, but direction matters more!**
+
+We don't normalize in practice because:
+
+- Magnitude can carry information (e.g., "this word is very relevant" vs "somewhat relevant")
+- Scaling by `√d_k` is cheaper than normalizing each vector
+- Empirically it works better this way
+
+---
+
+## How Learning Actually Works
+
+### The Initial Claim I Struggled With
+
+> "A 'louder' key can get more attention even if misaligned, and a 'quieter' key might get less even if well-aligned. The model learns whether to use magnitude or direction by learning Q/K/V matrices that encode the right information."
+
+### My Problem
+
+I couldn't just accept: **"The model learns whether to use magnitude or direction"**
+
+How could it possibly learn to pick one over the other? In math, it didn't sound like that should be possible.
+
+### The Breakthrough: Backpropagation
+
+Then I remembered what learning actually is:
+
+1. **Gradient descent**
+2. **Calculate loss** - see how wrong we were
+3. **Update the weights** and pass it back so other layers can fix their mistakes
+4. **Keep iterating** until we stop learning or improvements are tiny
+
+### What It Does Internally
+
+It slowly adjusts the weights. And **changing the matrix weights changes its direction in vector space**, which changes what parts are similar to what.
+
+These slow changes eventually make them similar.
+
+### The Key Insight
+
+> **The model doesn't learn to "pick" one or the other.**
+>
+> **It just points in the same direction slowly and steadily, which eventually causes them to align!**
+
+Through backprop, gradient descent slowly adjusts W_Q and W_K so that relevant Query-Key pairs naturally have high dot products. It's not a conscious "choice" - it's emergent from optimization!
+
+---
+
+## Understanding Q, K, V Matrices
+
+### The Context Problem
+
+**Say we have a sentence:** "The cat sat on the mat"
+
+Each word is represented as a vector, and these vectors are **context-independent**:
+
+- The vector for "cat" doesn't know who is sitting
+- The vector for "sat" doesn't know who is sitting or what they're sitting on
+- The vector for "mat" doesn't know what's on it
+
+**Attention solves this:** Each word looks at every other word and builds context-aware representations.
+
+### Starting Point: Embeddings
+
+```javascript
+Word: "cat"
+Embedding: [0.23, 0.91, 0.44, 0.12, ...] (512 numbers)
+```
+
+This is converting data into a high-dimensional array/vector (usually 512 dimensions).
+
+---
+
+### Query (Q): "What Should I Search For?"
+
+```c
+matmul(input, W_Q, Q)
+```
+
+**Example:**
+
+```
+"cat" embedding × W_Q = cat's Query vector
+```
+
+**W_Q learns to encode "Searching Behavior":**
+
+- Maybe "cat" (noun) learns to search for verbs
+- Maybe it learns to look for adjectives that describe it
+- Model learns this by iterating and slowly descending towards the minima
+
+**In other words:** Q defines what each word is looking for in other words.
+
+---
+
+### Key (K): "What Information Do I Advertise?"
+
+```c
+matmul(input, W_K, K)
+```
+
+**Example:**
+
+```
+"sat" embedding × W_K = sat's Key vector
+```
+
+**W_K learns to encode "I encode this type of info":**
+
+- "sat" might advertise: "I'm a verb, I'm an action, I happened in the past"
+- "mat" might advertise: "I'm a noun, I'm an object, I'm a location"
+
+**In other words:** K defines what information each word makes available for searching.
+
+---
+
+### Value (V): "What Information Should I Pass Forward?"
+
+```c
+matmul(input, W_V, V)
+```
+
+**Example:**
+
+```
+"sat" embedding × W_V = sat's Value vector
+```
+
+**W_V learns to encode semantic meaning:**
+
+- What information should be passed to the next layers if this word is attended to
+- It's the refined, task-relevant information extracted from the word
+
+**In other words:** V contains the actual useful information to retrieve when a word is deemed important.
+
+---
+
+### The Complete Flow
+
+```
+1. Compute Q, K, V for all words
+   ↓
+2. Calculate scores: Q × K^T
+   (How much should cat attend to each word?)
+   ↓
+3. Scale by √d_k
+   (Prevent gradient explosion)
+   ↓
+4. Apply softmax
+   (Convert to probability distribution)
+   ↓
+5. Weighted sum: scores × V
+   (Mix Value vectors based on attention)
+   ↓
+6. Output: context-aware representations
+```
+
+### Example: "cat" Attending to Other Words
+
+```
+Values from all words:
+cat_Value = [0.5, 1.0, 1.5]
+sat_Value = [2.0, 3.0, 4.0]  ← This gets "mixed in"
+mat_Value = [1.0, 1.5, 2.0]
+
+Attention scores for cat:
+cat→cat: 0.1  (low self-attention)
+cat→sat: 0.7  (HIGH - cat pays most attention to sat)
+cat→mat: 0.2  (medium attention)
+
+Result:
+cat_new = 0.1 × cat_Value + 0.7 × sat_Value + 0.2 × mat_Value
+        = [0.05, 0.1, 0.15] + [1.4, 2.1, 2.8] + [0.2, 0.3, 0.4]
+        = [1.65, 2.5, 3.35]
+```
+
+The new "cat" vector now contains information about what action it's doing (sitting)!
+
+### Signal vs Noise
+
+Whatever is not relevant automatically fades:
+
+- `cat→cat: 0.1 × vector` = small values (kills the noise)
+- `cat→mat: 0.2 × vector` = medium values
+- `cat→sat: 0.7 × vector` = large values (exaggerates the signal)
+
+We drown out the noise and exaggerate the signal!
+
+---
+
+## Why Scaling Matters
+
+### The Problem Without Scaling
+
+```
+Q·K with large dimensions → huge values
+
+softmax([50, 1000, 10]) → [0, 1, 0]  ← One-hot pattern!
+```
+
+This loses all the meaning/scores because softmax saturates to one-hot.
+
+### The Solution: Scale by √d_k
+
+```
+scaled_scores = (Q·K) / √d_k
+              = (Q·K) / √512
+              ≈ divide by ~22.6
+
+softmax([2.2, 4.4, 0.4]) → [0.09, 0.82, 0.09]  ← Smooth distribution!
+```
+
+### Why This Works
+
+- Without scaling → extreme softmax → gradients vanish → can't learn
+- With scaling → smooth distribution → gradients flow → learning works
+
+**It's about gradient preservation!**
+
+---
+
+## Multi-Head Attention
+
+### The Core Problem: One Head = One Pattern
+
+Imagine you have **only ONE attention head** for:
+
+> "The fluffy cat sat on the mat"
+
+#### What Can One Head Learn?
+
+Let's say it learns: **"Nouns should attend to verbs"**
+
+- So "cat" looks at "sat" ✅
+
+**But what about other useful patterns?**
+
+- "cat" might also need to know WHERE it sat → should look at "mat"
+- "cat" might need to know WHAT kind of cat → should look at "fluffy"
+- "sat" might need to know WHO is sitting → should look back at "cat"
+
+> **Key Insight:** One head can only learn one pattern well!
+
+### The Solution: Multiple Heads = Multiple Patterns
+
+With **8 heads**, each can specialize:
+
+```
+Sentence: "The fluffy cat sat on the blue mat"
+
+Head 1: "What does what?"
+  cat → sat (0.9)  // What action is cat doing?
+
+Head 2: "What describes this thing?"
+  cat → fluffy (0.8)  // What kind of cat?
+  mat → blue (0.7)    // What kind of mat?
+
+Head 3: "What causes this action?"
+  sat → cat (0.9)  // Who is sitting?
+
+Head 4: "Where/what is the location?"
+  sat → mat (0.8)  // Where is the sitting happening?
+  on → mat (0.8)   // What is "on" referring to?
+
+Head 5: "How are things spatially related?"
+  cat → mat (0.7)  // Physical relationship chain
+  sat → on → mat (chain of location)
+
+Heads 6-8: Learn other patterns...
+```
+
+Each head discovers a **different linguistic or semantic pattern!**
+
+### Mathematical Reason
+
+```c
+int head_dim = Q->cols / num_of_heads;
+// If embedding = 512 and heads = 8
+// Each head gets: 512 / 8 = 64 dimensions
+```
+
+#### One Big Head (512 dims):
+
+```
+Q (512) · K (512) = one compatibility score
+→ Tries to capture EVERYTHING in one number
+→ Has to compromise between different patterns
+```
+
+#### Eight Small Heads (64 dims each):
+
+```
+Head 1: Q (64) · K (64) = score for pattern 1
+Head 2: Q (64) · K (64) = score for pattern 2
+...
+Head 8: Q (64) · K (64) = score for pattern 8
+
+→ Each head specializes in ONE pattern
+→ Concatenate all 8 outputs = 512 dims again
+```
+
+### The Rocket vs Cat Example
+
+Suppose we want a head to learn about both rockets and cats. Do you think there are any commonalities between the two?
+
+**NO!** And thus a head can't learn two things that have nothing in common.
+
+**Why?** Can you put "cat" and "rocket" as a single vector and know which is which? No! It won't learn either - it will go all over the place.
+
+Remember: **Learning means pointing in the same direction as something we're trying to learn in high-dimensional vector space.**
+
+#### One Head Trying Both:
+
+```
+Cat semantics: [furry, meows, pets, small, ...]
+Rocket semantics: [space, propulsion, fast, metal, ...]
+
+→ Creates a confused mess in 64 dimensions
+→ Points nowhere useful
+```
+
+#### Two Separate Heads:
+
+```
+Head 1: Specializes in animal relationships
+  → Perfect at learning cat patterns
+
+Head 2: Specializes in mechanical/vehicle relationships
+  → Perfect at learning rocket patterns
+```
+
+### The Activation Function Analogy
+
+This is like why we use activation functions to introduce non-linearity:
+
+- A single line cannot learn complex patterns
+- A single head can only learn one kind of information well
+- We need multiple heads for complex patterns in GPT-like models
+
+### The Final Output Projection (W_O)
+
+```c
+Matrix *final_result = matrix_alloc(input->rows, W_0->cols);
+matmul(concat_result, W_0, final_result);
+```
+
+After concatenating 8 heads:
+
+```
+[head1: cat-action | head2: cat-description | head3: action-cause | ...]
+```
+
+These are 8 different perspectives, but they might have redundancy or conflicts.
+
+**W_O learns to:**
+
+1. Combine complementary info from different heads
+2. Resolve conflicts (if head1 says X, head2 says Y)
+3. Extract the most useful mixed representation
+
+It's like having 8 witnesses describe a scene, then W_O writes the coherent summary!
+
+---
+
+## Summary: What I Learned
+
+### 1. Q, K, V Are Empirical
+
+- They exist because they worked in experiments
+- Not because of mathematical necessity
+- If something else worked better, we'd use that
+
+### 2. Attention Measures Semantic Similarity
+
+- Are these words related in meaning?
+- **Direction matters more than magnitude** (but both matter!)
+- We use raw Q·K (not normalized) to preserve magnitude info
+
+### 3. Scaling Prevents Gradient Death
+
+- Large dot products → saturated softmax → one-hot → can't learn
+- Scaling by √d_k keeps distributions smooth → gradients flow
+
+### 4. Learning Is Alignment Through Optimization
+
+- Gradient descent slowly adjusts weights
+- Relevant Query-Key pairs naturally get high dot products
+- It's emergent behavior, not a conscious "choice"
+
+### 5. Multiple Heads = Multiple Patterns
+
+- One head can only learn one pattern well
+- Multiple heads can specialize in orthogonal concepts
+- Like having multiple search queries running in parallel
+
+### 6. Signal Amplification + Noise Suppression
+
+- Softmax creates probability distribution (sums to 1)
+- High attention scores get exaggerated
+- Low attention scores get suppressed
+- This preserves dynamic relationships between words
+
+---
+
+## The Magic Disappeared
+
+And that felt good - because now I actually know **WHY** it works, not just that it does.
+
+The magic disappeared when I understood the math.
+
+--TODO --
+
+- My understanding of multi head attention is somewhat flawed gotta fix it!
+  But i wanna move on to the next thing for no

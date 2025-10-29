@@ -5,7 +5,14 @@
 
 #define MASK_VALUE -INFINITY
 #define SQRT_2_OVER_PI 0.7978845608
-
+typedef struct
+{
+  float *input; // ADD THIS - save original input
+  float *normalized;
+  float mean;
+  float variance;
+  int size;
+} LayerNormCache;
 typedef struct
 {
   char *chars;         // Array of unique characters: "abcd...xyz !,."
@@ -103,7 +110,7 @@ void matrix_hadamard(Matrix *a, Matrix *b, Matrix *result)
 };
 void matrix_sum_rows(Matrix *m, Matrix *result)
 {
-  for (int i = 0; i < m->rows; i++)
+  for (int i = 0; i < m->capacity; i++)
   {
     result->data[i] = 0.0;
   }
@@ -258,12 +265,14 @@ void add_bias(Matrix *matrix, Matrix *bais, Matrix *result)
     }
   }
 }
-void layer_normalize(float *input, float *output, float *gain, float *bias, int length)
+
+void layer_normalize(float *input, LayerNormCache *cache, float *gain, float *bias, int length)
 {
+  cache->normalized = malloc(length * sizeof(float));
   float mean = 0;
   float varience = 0;
   float epsilon = 1e-5;
-
+  cache->input = input;
   for (int i = 0; i < length; i++)
   {
     mean += input[i];
@@ -278,6 +287,75 @@ void layer_normalize(float *input, float *output, float *gain, float *bias, int 
   for (int i = 0; i < length; i++)
   {
     float norm = (input[i] - mean) / sqrt(varience + epsilon);
-    output[i] = gain[i] * norm + bias[i];
+    cache->normalized[i] = gain[i] * norm + bias[i];
   }
+  cache->mean = mean;
+  cache->variance = varience;
+  cache->size = length;
 }
+typedef struct
+{
+  float *input; // ADD THIS - save original input
+  float *normalized;
+  float mean;
+  float variance;
+  int size;
+} LayerNormCache;
+void layer_normalize_backward(
+    Matrix *d_normalized,  // gradient flowing back from next layer
+    LayerNormCache *cache, // stored from forward pass (input, mean, std_dev, normalized)
+    float *gain,           // from forward
+    float *bias,           // from forward
+    int feature_size,      // dimensionality
+    Matrix *d_input,       // OUTPUT: gradient w.r.t. input
+    float *d_gain,         // OUTPUT: gradient w.r.t. gain
+    float *d_bias          // OUTPUT: gradient w.r.t. bias
+)
+{
+  float epsilon = 1e-5;
+
+  matrix_sum_rows(d_normalized, d_bias);
+  Matrix *d_norm = matrix_alloc(d_normalized->rows, d_normalized->cols);
+  for (int i = 0; i < d_norm->capacity; i++)
+  {
+    int col = i % feature_size;
+    d_norm->data[i] = d_normalized->data[i] * gain[col];
+  }
+  for (int i = 0; i < feature_size; i++)
+  {
+    d_gain[i] = 0.0f;
+  }
+  for (int row = 0; row < d_normalized->rows; row++)
+  {
+    for (int col = 0; col < d_normalized->cols; col++)
+    {
+      int flat_idx = row * d_normalized->cols + col;
+      float norm = (cache->input[flat_idx] - cache->mean) / sqrt(cache->variance + epsilon);
+      d_gain[col] += d_normalized->data[flat_idx] * norm; // Compute d_gain by accumulating contributions from all batch examples
+                                                          // In forward pass: gain[col] was broadcast (multiplied) across all rows at column position col
+                                                          // In backward pass: we reduce by summing gradients from all rows back into d_gain[col]
+                                                          // This is because one gain parameter affects multiple positions (entire column across batch) just the same as adding bias
+    }
+  }
+
+  float sum_d_norm_times_norm = 0.0f;
+  float sum_d_norm = 0.0f;
+
+  for (int i = 0; i < d_norm->capacity; i++)
+  {
+    float norm_i = (cache->input[i] - cache->mean) / sqrt(cache->variance + epsilon);
+    sum_d_norm += d_norm->data[i];
+    sum_d_norm_times_norm += d_norm->data[i] * norm_i;
+  }
+  int N = d_norm->capacity;
+  float mean_d_norm_times_norm = sum_d_norm_times_norm / N;
+  float mean_d_norm = sum_d_norm / N;
+  float std_dev = sqrt(cache->variance + epsilon);
+  for (int i = 0; i < d_norm->capacity; i++)
+  {
+    float norm_i = (cache->input[i] - cache->mean) / std_dev;
+
+    d_input->data[i] = (1.0f / std_dev) * (d_norm->data[i] - mean_d_norm - norm_i * mean_d_norm_times_norm);
+  }
+  matrix_free(d_norm);
+};

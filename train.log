@@ -1,0 +1,37 @@
+seen: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Vocab size : 85
+Text length: 5378303 chars
+
+Model initialised  (d_model=256, layers=6, heads=8, ctx=256)
+
+Epoch  1 | Step 300/3000 | avg_loss = 3.3646
+Epoch  1 | Step 600/3000 | avg_loss = 3.3463
+Epoch  1 | Step 900/3000 | avg_loss = 3.3454
+Epoch  1 | Step 1200/3000 | avg_loss = 3.3030
+Epoch  1 | Step 1500/3000 | avg_loss = 3.2505
+Epoch  1 | Step 1800/3000 | avg_loss = 3.1912
+Epoch  1 | Step 2100/3000 | avg_loss = 3.1448
+Epoch  1 | Step 2400/3000 | avg_loss = 3.1037
+Epoch  1 | Step 2700/3000 | avg_loss = 3.0698
+Epoch  1 | Step 3000/3000 | avg_loss = 3.0397
+
+=== Epoch 1 done  avg_loss=3.0397 ===
+Sanity check loss: 2.7490
+ re thaifhel t s iserg s tif d bremhrye hin y oreseafe n s athan ndos d d,  s ou s  rithrenlthen fon. t nees netr s ral bearthe peeny taENy
+AEEoninetindothenit m miDG cod trs monndonolerth aunoreghh wyoth reos urse h thhe chene cany
+
+
+Wh dment iu hl, h ig, heniWhoechaHS g tt.
+HLEOOAEE.
+SIne IHSoth bSample:
+KING: re thaifhel t s iserg s tif d bremhrye hin y oreseafe n s athan ndos d d,  s ou s  rithrenlthen fon. t nees netr s ral bearthe peeny taENy
+AEEoninetindothenit m miDG cod trs monndonolerth aunoreghh wyoth reos urse h thhe chene cany
+
+
+Wh dment iu hl, h ig, heniWhoechaHS g tt.
+HLEOOAEE.
+SIne IHSoth b
+
+Epoch  2 | Step 300/3000 | avg_loss = 2.7290
+Epoch  2 | Step 600/3000 | avg_loss = 2.7153
+Epoch  2 | Step 900/3000 | avg_loss = 2.7082

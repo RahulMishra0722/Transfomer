@@ -1,89 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 #include "math_ops.h"
 #include "transformer.h"
 #include <time.h>
 
-typedef struct
-{
-  // Model hyperparameters
-  int vocab_size;
-  int d_model;
-  int num_layers;
-  int num_heads;
-  int ffn_hidden_dim;
 
-  // Embeddings
-  Matrix *embedding_table;
-
-  // Decoder layers (arrays of pointers, one per layer)
-  Matrix **W_Q_layers;
-  Matrix **W_K_layers;
-  Matrix **W_V_layers;
-  Matrix **W_O_layers;
-
-  Matrix **W1_layers;
-  Matrix **b1_layers;
-  Matrix **W2_layers;
-  Matrix **b2_layers;
-
-  float **ln1_gain_layers;
-  float **ln1_bias_layers;
-  float **ln2_gain_layers;
-  float **ln2_bias_layers;
-
-  // Output projection
-  Matrix *W_out;
-  Matrix *b_out;
-
-} TransformerModel;
-typedef struct
-{
-  // Add these fields:
-  Matrix *input; // Original input to attention (needed for weight gradients)
-
-  Matrix *result;
-  Matrix *concat_result;
-  Matrix **head_outputs;
-  Matrix **head_scores;
-  Matrix **Q_heads;
-  Matrix **K_heads;
-  Matrix **V_heads;
-  Matrix *Q;
-  Matrix *K;
-  Matrix *V;
-  int num_of_heads;
-  int head_dim;
-} MultiHeadAttentionCache;
-
-typedef struct
-{
-  // ADD THIS:
-  Matrix *input; // Original decoder_input (needed for first residual gradient)
-
-  MultiHeadAttentionCache attention_cache;
-  Matrix *residual_1;
-  LayerNormCache *ln1_caches;
-
-  // ADD THIS:
-  Matrix *ln1_input; // Input to first LayerNorm (= residual_1, but save pointer)
-
-  Matrix *norm1;
-  Matrix *ffn_pre_gelu;
-  Matrix *ffn_post_gelu;
-  // REMOVE ffn_hidden if it's redundant
-  Matrix *ffn_output;
-
-  Matrix *residual_2;
-  LayerNormCache *ln2_caches;
-
-  // ADD THIS:
-  Matrix *ln2_input; // Input to second LayerNorm (= residual_2)
-
-  int num_rows;
-} DecoderLayerCache;
 char *load_text_file(char *filepath, int *output_length)
 {
   FILE *file = fopen(filepath, "r");
@@ -218,7 +142,7 @@ char *detokenize(int *token_ids, int length, Vocabulary *vocab)
     }
     arr[i] = vocab->chars[token_ids[i]];
   }
-  arr[length + 1] = '\0';
+  arr[length] = '\0';
   return arr;
 }
 void add_positional_encoding(Matrix *embeddings, int seq_len, int d_model)
@@ -555,7 +479,7 @@ void multi_head_masked_attention_backward(
   matrix_transpose(cache->concat_result, concat_result_T);
   Matrix *d_concat_result = matrix_alloc(cache->concat_result->rows, cache->concat_result->cols);
   matmul(d_final_result, W_0_T, d_concat_result);
-  matmul(concat_result_T, d_concat_result, d_W_0);
+  matmul(concat_result_T, d_final_result, d_W_0); // dW_O = concat^T × d_output (not d_concat)
   Matrix **d_head_outputs = malloc(cache->num_of_heads * sizeof(Matrix *));
   for (int i = 0; i < cache->num_of_heads; i++)
   {
@@ -680,6 +604,7 @@ void multi_head_masked_attention_backward(
   matrix_free(d_Q);
   matrix_free(d_K);
   matrix_free(d_V);
+  matrix_free(input_T);
   free(d_Q_heads);
   free(d_K_heads);
   free(d_V_heads);
@@ -726,6 +651,9 @@ void decoder_layer_backward(
   Matrix *d_residual_2 = matrix_alloc(dOutput->rows, dOutput->cols);
   Matrix *d_residual_1 = matrix_alloc(dOutput->rows, dOutput->cols);
 
+  memset(dLn2_gain, 0, dOutput->cols * sizeof(float));
+  memset(dLn2_bias, 0, dOutput->cols * sizeof(float));
+
   for (int i = 0; i < dOutput->rows; i++)
   {
     int start_index = i * dOutput->cols;
@@ -755,16 +683,17 @@ void decoder_layer_backward(
     matrix_free(d_residual2_row);
   }
   Matrix *grad_ffn_output = matrix_alloc(d_residual_2->rows, d_residual_2->cols);
-  Matrix *grad_norm1 = matrix_alloc(d_residual_2->rows, d_residual_2->cols);
   matrix_copy(d_residual_2, grad_ffn_output);
-  matrix_copy(d_residual_2, grad_norm1);
+
   Matrix *d_norm1_from_ffn = matrix_alloc(cache->norm1->rows, cache->norm1->cols);
   feed_forward_backward(grad_ffn_output, cache->norm1, cache->ffn_pre_gelu, cache->ffn_post_gelu, W1, W2, d_norm1_from_ffn, dW1, dB1, dW2, dB2);
-  for (int i = 0; i < d_norm1_from_ffn->capacity; i++)
-  {
-    grad_norm1->data[i] = grad_norm1->data[i] + d_norm1_from_ffn->data[i];
-  }
+
+  // The correct grad_norm1 is ONLY the FFN backprop output — not d_residual_2 (that's the skip)
+  Matrix *grad_norm1 = d_norm1_from_ffn;
+
   // The correct way could be either of these but i think first one is more correct idk
+  memset(dLn1_gain, 0, dOutput->cols * sizeof(float));
+  memset(dLn1_bias, 0, dOutput->cols * sizeof(float));
   for (int i = 0; i < cache->norm1->rows; i++)
   {
     Matrix *d_norm_row = matrix_alloc(1, cache->residual_1->cols);
@@ -776,7 +705,9 @@ void decoder_layer_backward(
     layer_normalize_backward(d_norm_row, &cache->ln1_caches[i], ln1_gain, ln1_bias, dOutput->cols, d_residual2_row, dLn1_gain, dLn1_bias);
     for (int j = 0; j < d_residual_1->cols; j++)
     {
-      d_residual_1->data[i * d_residual_1->cols + j] = d_residual2_row->data[j];
+      // ln1 backward gives gradient at residual_1; also add the skip from residual_2
+      d_residual_1->data[i * d_residual_1->cols + j] =
+          d_residual2_row->data[j] + d_residual_2->data[i * d_residual_2->cols + j];
     }
     matrix_free(d_norm_row);
     matrix_free(d_residual2_row);
@@ -797,7 +728,6 @@ void decoder_layer_backward(
   matrix_free(d_residual_1);
   matrix_free(d_residual_2);
   matrix_free(grad_ffn_output);
-  matrix_free(grad_norm1);
   matrix_free(d_norm1_from_ffn);
   matrix_free(d_attention_result);
   matrix_free(d_decoder_input_from_residual);
@@ -820,14 +750,12 @@ DecoderLayerCache decoder_layer(
   cache.residual_1 = matrix_alloc(decoder_input->rows, decoder_input->cols);
   cache.ln1_caches = malloc(decoder_input->rows * sizeof(LayerNormCache));
   matrix_add(cache.attention_cache.result, decoder_input, cache.residual_1);
-
   float *normalised_rows_for_self_attention_output = malloc(cache.residual_1->capacity * sizeof(float));
-
   for (int i = 0; i < cache.attention_cache.result->rows; i++)
   {
     int start_index = i * cache.residual_1->cols;
     int end_index = start_index + cache.residual_1->cols;
-    float *layer = get_row(cache.residual_1->data, start_index, end_index);
+    float *layer = &cache.residual_1->data[start_index];
 
     layer_normalize(layer, &cache.ln1_caches[i], ln1_gain, ln1_bias, cache.residual_1->cols);
 
@@ -835,7 +763,6 @@ DecoderLayerCache decoder_layer(
     {
       normalised_rows_for_self_attention_output[start_index + j] = cache.ln1_caches[i].normalized[j];
     }
-    free(layer);
   }
   cache.norm1 = matrix_alloc(decoder_input->rows, decoder_input->cols);
 
@@ -849,21 +776,20 @@ DecoderLayerCache decoder_layer(
   cache.ffn_post_gelu = matrix_alloc(cache.norm1->rows, W1->cols);
   feed_forward(cache.norm1, W1, b1, W2, b2, cache.ffn_output, cache.ffn_post_gelu, cache.ffn_pre_gelu);
   cache.residual_2 = matrix_alloc(decoder_input->rows, decoder_input->cols);
-  matrix_add(cache.ffn_output, cache.norm1, cache.residual_2);
+  matrix_add(cache.ffn_output, cache.residual_1, cache.residual_2);
   float *normalised_rows_for_feed_forward_output = malloc(cache.residual_2->capacity * sizeof(float));
   cache.ln2_caches = malloc(decoder_input->rows * sizeof(LayerNormCache));
   for (int i = 0; i < cache.attention_cache.result->rows; i++)
   {
     int start_index = i * cache.residual_2->cols;
     int end_index = start_index + cache.residual_2->cols;
-    float *layer = get_row(cache.residual_2->data, start_index, end_index);
+    float *layer = &cache.residual_2->data[start_index];
     layer_normalize(layer, &cache.ln2_caches[i], ln2_gain, ln2_bias, cache.residual_2->cols);
 
     for (int j = 0; j < (end_index - start_index); j++)
     {
       normalised_rows_for_feed_forward_output[start_index + j] = cache.ln2_caches[i].normalized[j];
     }
-    free(layer);
   }
   for (int i = 0; i < cache.norm1->capacity; i++)
   {
@@ -908,10 +834,10 @@ void decoder_backward(Matrix *d_output,           // gradient from output projec
 
 {
   Matrix *current_gradient = d_output;
-  for (int layer = num_layers - 1; layer > 0; layer--)
+  for (int layer = num_layers - 1; layer >= 0; layer--)
   {
     Matrix *layer_input_grad = matrix_alloc(d_output->rows, d_output->cols);
-    decoder_layer_backward(current_gradient, caches[layer], W_Q_self_layers[layer], W_K_self_layers[layer], W_V_self_layers[layer], W_O_self_layers[layer], W1_layers[layer], W2_layers[layer], ln1_gain_layers[layer], ln1_bias_layers[layer], ln2_gain_layers[layer], ln2_bias_layers[layer], num_heads, layer_input_grad, dW_Q_self_layers[layer], dW_K_self_layers[layer], dW_V_self_layers[layer], dW_O_self_layers[layer], dW1_layers[layer], dB1_layers[layer], dW2_layers[layer], dB2_layers[layer], dLn1_gain_layers[layer], dLn1_bias_layers[layer], dLn2_gain_layers, dLn2_bias_layers[layer]);
+    decoder_layer_backward(current_gradient, caches[layer], W_Q_self_layers[layer], W_K_self_layers[layer], W_V_self_layers[layer], W_O_self_layers[layer], W1_layers[layer], W2_layers[layer], ln1_gain_layers[layer], ln1_bias_layers[layer], ln2_gain_layers[layer], ln2_bias_layers[layer], num_heads, layer_input_grad, dW_Q_self_layers[layer], dW_K_self_layers[layer], dW_V_self_layers[layer], dW_O_self_layers[layer], dW1_layers[layer], dB1_layers[layer], dW2_layers[layer], dB2_layers[layer], dLn1_gain_layers[layer], dLn1_bias_layers[layer], dLn2_gain_layers[layer], dLn2_bias_layers[layer]);
     if (layer < num_layers - 1)
     {
       matrix_free(current_gradient);
@@ -924,6 +850,50 @@ void decoder_backward(Matrix *d_output,           // gradient from output projec
   }
   matrix_free(current_gradient);
 }
+void free_multihead_attention_cache(MultiHeadAttentionCache *cache) {
+  matrix_free(cache->Q);
+  matrix_free(cache->K);
+  matrix_free(cache->V);
+  for (int i = 0; i < cache->num_of_heads; i++) {
+    matrix_free(cache->Q_heads[i]);
+    matrix_free(cache->K_heads[i]);
+    matrix_free(cache->V_heads[i]);
+    matrix_free(cache->head_outputs[i]);
+    matrix_free(cache->head_scores[i]);
+  }
+  free(cache->Q_heads);
+  free(cache->K_heads);
+  free(cache->V_heads);
+  free(cache->head_outputs);
+  free(cache->head_scores);
+  matrix_free(cache->concat_result);
+  matrix_free(cache->result);
+}
+
+void free_decoder_layer_cache(DecoderLayerCache *cache) {
+  free_multihead_attention_cache(&cache->attention_cache);
+  
+  if (cache->ln1_caches) {
+    for (int i = 0; i < cache->residual_1->rows; i++) {
+      free(cache->ln1_caches[i].normalized);
+    }
+    free(cache->ln1_caches);
+  }
+  if (cache->ln2_caches) {
+    for (int i = 0; i < cache->residual_2->rows; i++) {
+      free(cache->ln2_caches[i].normalized);
+    }
+    free(cache->ln2_caches);
+  }
+  
+  matrix_free(cache->residual_1);
+  matrix_free(cache->norm1);
+  matrix_free(cache->ffn_output);
+  matrix_free(cache->ffn_pre_gelu);
+  matrix_free(cache->ffn_post_gelu);
+  matrix_free(cache->residual_2);
+}
+
 void decoder(
     Matrix *decoder_input, // Target sequence embeddings (with positional encoding)
     // Self-attention weights (masked) for each layer
@@ -953,13 +923,14 @@ void decoder(
   for (int i = 0; i < num_layers; i++)
   {
     Matrix *next_output = matrix_alloc(decoder_input->rows, decoder_input->cols);
-    decoder_layer(current,
+    DecoderLayerCache cache = decoder_layer(current,
                   W_Q_self_layers[i], W_K_self_layers[i], W_V_self_layers[i], W_O_self_layers[i],
                   num_heads,
                   W1_layers[i], b1_layers[i], W2_layers[i], b2_layers[i],
                   ln1_gain_layers[i], ln1_bias_layers[i],
                   ln2_gain_layers[i], ln2_bias_layers[i], // Changed from ln3
                   next_output);
+    free_decoder_layer_cache(&cache);
     if (i > 0)
     {
       matrix_free(current);
@@ -1012,17 +983,20 @@ Matrix *output_projection(Matrix *decoder_output, Matrix *W_out, Matrix *b_out)
   add_bias(projected_output, b_out, projected_output);
   return projected_output;
 }
-int sample_token(Matrix *logits, int vocab_size)
+int sample_token(Matrix *logits, int vocab_size, float temperature)
 {
-  float r = rand() / (double)RAND_MAX;
-  mat_softmax_rows(logits);
-
-  float cummulative = 0.0;
   int last_row_start = (logits->rows - 1) * logits->cols;
   for (int i = 0; i < vocab_size; i++)
+    logits->data[last_row_start + i] /= temperature;
+
+  mat_softmax_rows(logits);
+  float r = rand() / (double)RAND_MAX;
+
+  float cumulative = 0.0f;
+  for (int i = 0; i < vocab_size; i++)
   {
-    cummulative += logits->data[last_row_start + i];
-    if (cummulative >= r)
+    cumulative += logits->data[last_row_start + i];
+    if (cumulative >= r)
     {
       return i;
     }
@@ -1112,8 +1086,8 @@ void feed_forward_backward(
   matrix_free(input_T);
   matrix_free(W1_T);
   matrix_free(W2_T);
-  matrix_free(hidden_post_gelu_T);
   matrix_free(d_hidden_pre_gelu);
+  matrix_free(d_hidden_post_gelu);
 }
 
 void embedding_backward(
@@ -1126,56 +1100,13 @@ void embedding_backward(
   for (int i = 0; i < seq_len; i++)
   {
     int token_id = token_ids[i];
-    for (int j = 0; j < seq_len; j++)
+    for (int j = 0; j < d_embeddings->cols; j++)
     {
       d_embedding_table->data[token_id * d_embedding_table->cols + j] += d_embeddings->data[i * d_embeddings->cols + j];
     }
   }
 };
-update_weights(Matrix *weights, Matrix *gradients, float learning_rate)
-{
-  for (int i = 0; i < weights->capacity; i++)
-  {
-    int index = i;
-    weights->data[index] = weights->data[index] - (learning_rate * gradients->data[index]);
-  }
-};
-update_weights_float(float *weights, float *gradients, int size, float learning_rate)
-{
-  for (int i = 0; i < size; i++)
-  {
-    weights[i] = weights[i] - (gradients[i] * learning_rate);
-  }
-}
-// 4. Complete training step with backward pass
-float train_step_with_gradients(
-    int *input_tokens,
-    int *target_tokens,
-    int seq_len,
-    int num_layers,
-    int num_heads,
-    int d_model,
-    int vocab_size,
-    // All model weights (to be updated)
-    Matrix *embedding_table,
-    Matrix **W_Q_layers,
-    Matrix **W_K_layers,
-    Matrix **W_V_layers,
-    Matrix **W_O_layers,
-    Matrix **W1_layers,
-    Matrix **b1_layers,
-    Matrix **W2_layers,
-    Matrix **b2_layers,
-    float **ln1_gain_layers,
-    float **ln1_bias_layers,
-    float **ln2_gain_layers,
-    float **ln2_bias_layers,
-    Matrix *W_out,
-    Matrix *b_out,
-    DecoderLayerCache **layer_caches,
-    float learning_rate) {
-
-};
+// Complete training step with backward pass is implemented below (train_step_with_gradients)
 TransformerModel *init_model(int vocab_size, int d_model, int num_layers, int num_heads)
 {
   int ffn_hidden_dim = 4 * d_model;
@@ -1282,7 +1213,7 @@ TransformerModel *init_model(int vocab_size, int d_model, int num_layers, int nu
 
   return model;
 }
-char *generate(TransformerModel *model, Vocabulary *vocab, char *prompt, int max_len)
+char *generate(TransformerModel *model, Vocabulary *vocab, char *prompt, int max_len, int context_len)
 {
   int prompt_token_length;
   int *prompt_token_ids = tokenize(prompt, vocab, &prompt_token_length);
@@ -1294,9 +1225,12 @@ char *generate(TransformerModel *model, Vocabulary *vocab, char *prompt, int max
   int current_length = prompt_token_length;
   for (int i = 0; i < max_len; i++)
   {
-    Matrix *embeddings = embed_tokens(sequence, current_length, model->embedding_table);
-    add_positional_encoding(embeddings, current_length, model->d_model);
-    Matrix *decoder_output = matrix_alloc(current_length, model->d_model);
+    int gen_start = (current_length > context_len) ? (current_length - context_len) : 0;
+    int window_len = current_length - gen_start;
+
+    Matrix *embeddings = embed_tokens(sequence + gen_start, window_len, model->embedding_table);
+    add_positional_encoding(embeddings, window_len, model->d_model);
+    Matrix *decoder_output = matrix_alloc(window_len, model->d_model);
     decoder(
         embeddings,
         model->W_Q_layers,      // <-- from model
@@ -1315,16 +1249,27 @@ char *generate(TransformerModel *model, Vocabulary *vocab, char *prompt, int max
         model->num_heads,       // <-- from model
         decoder_output);
     Matrix *projected_output = output_projection(decoder_output, model->W_out, model->b_out);
-    int last_row_index = current_length - 1;
+    int last_row_index = window_len - 1;
     Matrix *last_row_mat = matrix_alloc(1, projected_output->cols);
 
     for (int col = 0; col < projected_output->cols; col++)
     {
       last_row_mat->data[col] = projected_output->data[last_row_index * projected_output->cols + col];
     }
-    int next_token = sample_token(last_row_mat, vocab->vocab_size);
+    int next_token = sample_token(last_row_mat, vocab->vocab_size, 0.8f);
     sequence[current_length] = next_token;
     current_length++;
+
+    char *new_char_str = detokenize(&next_token, 1, vocab);
+    for (int j = 0; new_char_str[j] != '\0'; j++) {
+      if (!isprint((unsigned char)new_char_str[j]) && new_char_str[j] != '\n' && new_char_str[j] != '\t') {
+        new_char_str[j] = ' '; // replace weird chars with space
+      }
+    }
+    printf("%s", new_char_str);
+    fflush(stdout);
+    free(new_char_str);
+
     matrix_free(decoder_output);
     matrix_free(projected_output);
     matrix_free(last_row_mat);
@@ -1341,7 +1286,9 @@ float train_step_with_gradients(
     int *input_tokens,
     int *target_tokens,
     int seq_len,
-    float learning_rate)
+    float learning_rate,
+    AdamState *adam_state,
+    int step)
 {
   // ========== FORWARD PASS ==========
   Matrix *embeddings = embed_tokens(input_tokens, seq_len, model->embedding_table);
@@ -1351,14 +1298,27 @@ float train_step_with_gradients(
 
   Matrix *decoder_output = matrix_alloc(seq_len, model->d_model);
 
-  // Run through ALL decoder layers using the decoder function
-  decoder(embeddings,
-          model->W_Q_layers, model->W_K_layers, model->W_V_layers, model->W_O_layers,
-          model->W1_layers, model->b1_layers, model->W2_layers, model->b2_layers,
-          model->ln1_gain_layers, model->ln1_bias_layers,
-          model->ln2_gain_layers, model->ln2_bias_layers,
-          model->num_layers, model->num_heads,
-          decoder_output);
+  // Run forward pass layer by layer, saving caches for backprop
+  Matrix *current = embeddings;
+  for (int i = 0; i < model->num_layers; i++)
+  {
+    Matrix *next_output = matrix_alloc(seq_len, model->d_model);
+    DecoderLayerCache *cache_ptr = malloc(sizeof(DecoderLayerCache));
+    *cache_ptr = decoder_layer(current,
+                               model->W_Q_layers[i], model->W_K_layers[i],
+                               model->W_V_layers[i], model->W_O_layers[i],
+                               model->num_heads,
+                               model->W1_layers[i], model->b1_layers[i],
+                               model->W2_layers[i], model->b2_layers[i],
+                               model->ln1_gain_layers[i], model->ln1_bias_layers[i],
+                               model->ln2_gain_layers[i], model->ln2_bias_layers[i],
+                               next_output);
+    layer_caches[i] = cache_ptr;
+    current = next_output;
+  }
+  for (int j = 0; j < decoder_output->capacity; j++)
+    decoder_output->data[j] = current->data[j];
+  matrix_free(current);
 
   Matrix *logits = output_projection(decoder_output, model->W_out, model->b_out);
   float loss = cross_entropy_loss(logits, target_tokens, seq_len, model->vocab_size);
@@ -1368,16 +1328,17 @@ float train_step_with_gradients(
   // Gradient of loss w.r.t. logits
   Matrix *dLogits = matrix_alloc(logits->rows, logits->cols);
   int vocab_size = model->vocab_size;
+  float inv_seq_len = 1.0f / seq_len;
   for (int row = 0; row < seq_len; row++)
   {
     int correct_token = target_tokens[row];
     for (int col = 0; col < vocab_size; col++)
     {
       int index = row * vocab_size + col;
-      dLogits->data[index] = logits->data[index];
-      if (col == correct_token) // FIX: was "col == target_tokens"
+      dLogits->data[index] = logits->data[index] * inv_seq_len;
+      if (col == correct_token)
       {
-        dLogits->data[index] -= 1.0;
+        dLogits->data[index] -= inv_seq_len;
       }
     }
   }
@@ -1449,31 +1410,59 @@ float train_step_with_gradients(
   Matrix *d_embedding_table = matrix_alloc(model->embedding_table->rows, model->embedding_table->cols);
   embedding_backward(d_embeddings, input_tokens, seq_len, d_embedding_table);
 
+  // ========== GRADIENT CLIPPING ==========
+  float total_norm = 0.0f;
+  
+  #define ADD_MAT_NORM(m) for(int _i=0; _i<(m)->capacity; _i++) total_norm += (m)->data[_i] * (m)->data[_i]
+  #define ADD_FLT_NORM(arr, size) for(int _i=0; _i<(size); _i++) total_norm += (arr)[_i] * (arr)[_i]
+  
+  ADD_MAT_NORM(dW_out);
+  ADD_MAT_NORM(db_out);
+  ADD_MAT_NORM(d_embedding_table);
+  
+  for (int i = 0; i < model->num_layers; i++) {
+    ADD_MAT_NORM(dW_Q_layers[i]); ADD_MAT_NORM(dW_K_layers[i]); ADD_MAT_NORM(dW_V_layers[i]); ADD_MAT_NORM(dW_O_layers[i]);
+    ADD_MAT_NORM(dW1_layers[i]); ADD_MAT_NORM(db1_layers[i]); ADD_MAT_NORM(dW2_layers[i]); ADD_MAT_NORM(db2_layers[i]);
+    ADD_FLT_NORM(dLn1_gain_layers[i], model->d_model); ADD_FLT_NORM(dLn1_bias_layers[i], model->d_model);
+    ADD_FLT_NORM(dLn2_gain_layers[i], model->d_model); ADD_FLT_NORM(dLn2_bias_layers[i], model->d_model);
+  }
+  
+  total_norm = sqrtf(total_norm);
+  float max_norm = 5.0f;
+  if (total_norm > max_norm) {
+    float scale = max_norm / total_norm;
+    #define SCALE_MAT(m) for(int _i=0; _i<(m)->capacity; _i++) (m)->data[_i] *= scale
+    #define SCALE_FLT(arr, size) for(int _i=0; _i<(size); _i++) (arr)[_i] *= scale
+    
+    SCALE_MAT(dW_out); SCALE_MAT(db_out); SCALE_MAT(d_embedding_table);
+    for (int i = 0; i < model->num_layers; i++) {
+      SCALE_MAT(dW_Q_layers[i]); SCALE_MAT(dW_K_layers[i]); SCALE_MAT(dW_V_layers[i]); SCALE_MAT(dW_O_layers[i]);
+      SCALE_MAT(dW1_layers[i]); SCALE_MAT(db1_layers[i]); SCALE_MAT(dW2_layers[i]); SCALE_MAT(db2_layers[i]);
+      SCALE_FLT(dLn1_gain_layers[i], model->d_model); SCALE_FLT(dLn1_bias_layers[i], model->d_model);
+      SCALE_FLT(dLn2_gain_layers[i], model->d_model); SCALE_FLT(dLn2_bias_layers[i], model->d_model);
+    }
+  }
+
   // ========== UPDATE WEIGHTS ==========
+  adam_update_matrix(model->W_out, dW_out, adam_state->m_W_out, adam_state->v_W_out, learning_rate, step);
+  adam_update_matrix(model->b_out, db_out, adam_state->m_b_out, adam_state->v_b_out, learning_rate, step);
+  adam_update_matrix(model->embedding_table, d_embedding_table, adam_state->m_embedding_table, adam_state->v_embedding_table, learning_rate, step);
 
-  // Update output projection
-  update_weights(model->W_out, dW_out, learning_rate);
-  update_weights(model->b_out, db_out, learning_rate);
-
-  // Update embedding table
-  update_weights(model->embedding_table, d_embedding_table, learning_rate);
-
-  // Update all decoder layer weights
   for (int i = 0; i < model->num_layers; i++)
   {
-    update_weights(model->W_Q_layers[i], dW_Q_layers[i], learning_rate);
-    update_weights(model->W_K_layers[i], dW_K_layers[i], learning_rate);
-    update_weights(model->W_V_layers[i], dW_V_layers[i], learning_rate);
-    update_weights(model->W_O_layers[i], dW_O_layers[i], learning_rate);
-    update_weights(model->W1_layers[i], dW1_layers[i], learning_rate);
-    update_weights(model->b1_layers[i], db1_layers[i], learning_rate);
-    update_weights(model->W2_layers[i], dW2_layers[i], learning_rate);
-    update_weights(model->b2_layers[i], db2_layers[i], learning_rate);
+    adam_update_matrix(model->W_Q_layers[i], dW_Q_layers[i], adam_state->m_W_Q_layers[i], adam_state->v_W_Q_layers[i], learning_rate, step);
+    adam_update_matrix(model->W_K_layers[i], dW_K_layers[i], adam_state->m_W_K_layers[i], adam_state->v_W_K_layers[i], learning_rate, step);
+    adam_update_matrix(model->W_V_layers[i], dW_V_layers[i], adam_state->m_W_V_layers[i], adam_state->v_W_V_layers[i], learning_rate, step);
+    adam_update_matrix(model->W_O_layers[i], dW_O_layers[i], adam_state->m_W_O_layers[i], adam_state->v_W_O_layers[i], learning_rate, step);
+    adam_update_matrix(model->W1_layers[i], dW1_layers[i], adam_state->m_W1_layers[i], adam_state->v_W1_layers[i], learning_rate, step);
+    adam_update_matrix(model->b1_layers[i], db1_layers[i], adam_state->m_b1_layers[i], adam_state->v_b1_layers[i], learning_rate, step);
+    adam_update_matrix(model->W2_layers[i], dW2_layers[i], adam_state->m_W2_layers[i], adam_state->v_W2_layers[i], learning_rate, step);
+    adam_update_matrix(model->b2_layers[i], db2_layers[i], adam_state->m_b2_layers[i], adam_state->v_b2_layers[i], learning_rate, step);
 
-    update_weights_float(model->ln1_gain_layers[i], dLn1_gain_layers[i], model->d_model, learning_rate);
-    update_weights_float(model->ln1_bias_layers[i], dLn1_bias_layers[i], model->d_model, learning_rate);
-    update_weights_float(model->ln2_gain_layers[i], dLn2_gain_layers[i], model->d_model, learning_rate);
-    update_weights_float(model->ln2_bias_layers[i], dLn2_bias_layers[i], model->d_model, learning_rate);
+    adam_update_float(model->ln1_gain_layers[i], dLn1_gain_layers[i], adam_state->m_ln1_gain_layers[i], adam_state->v_ln1_gain_layers[i], model->d_model, learning_rate, step);
+    adam_update_float(model->ln1_bias_layers[i], dLn1_bias_layers[i], adam_state->m_ln1_bias_layers[i], adam_state->v_ln1_bias_layers[i], model->d_model, learning_rate, step);
+    adam_update_float(model->ln2_gain_layers[i], dLn2_gain_layers[i], adam_state->m_ln2_gain_layers[i], adam_state->v_ln2_gain_layers[i], model->d_model, learning_rate, step);
+    adam_update_float(model->ln2_bias_layers[i], dLn2_bias_layers[i], adam_state->m_ln2_bias_layers[i], adam_state->v_ln2_bias_layers[i], model->d_model, learning_rate, step);
   }
 
   // ========== CLEANUP ==========
@@ -1520,8 +1509,308 @@ float train_step_with_gradients(
   free(dLn2_gain_layers);
   free(dLn2_bias_layers);
 
-  // TODO: Free layer_caches properly (need to free internal matrices in each cache)
+  // Free intermediate outputs stored as layer inputs (except layer 0 input, which is embeddings and freed separately)
+  for (int i = 1; i < model->num_layers; i++) {
+    matrix_free(layer_caches[i]->input);
+  }
+
+  // Free layer_caches properly
+  for (int i = 0; i < model->num_layers; i++) {
+    free_decoder_layer_cache(layer_caches[i]);
+    free(layer_caches[i]);
+  }
   free(layer_caches);
 
   return loss;
 }
+
+// ── Weight persistence ────────────────────────────────────────────────────────
+
+// Binary format:
+//   [int] vocab_size  [int] d_model  [int] num_layers  [int] num_heads  [int] ffn_hidden_dim
+//   [vocab_size chars] vocab chars
+//   embedding_table  (vocab_size * d_model floats)
+//   per-layer: W_Q, W_K, W_V, W_O, W1, b1, W2, b2,
+//              ln1_gain (d_model), ln1_bias (d_model),
+//              ln2_gain (d_model), ln2_bias (d_model)
+//   W_out  (vocab_size * d_model floats)
+//   b_out  (vocab_size floats)
+
+static void write_floats(FILE *f, const float *data, int n)
+{
+  fwrite(data, sizeof(float), n, f);
+}
+
+static void read_floats(FILE *f, float *data, int n)
+{
+  if (fread(data, sizeof(float), n, f) != (size_t)n)
+  {
+    fprintf(stderr, "read_floats: unexpected EOF\n");
+    exit(1);
+  }
+}
+
+static void write_matrix(FILE *f, const Matrix *m)
+{
+  fwrite(&m->rows, sizeof(int), 1, f);
+  fwrite(&m->cols, sizeof(int), 1, f);
+  write_floats(f, m->data, m->rows * m->cols);
+}
+
+static Matrix *read_matrix(FILE *f)
+{
+  int rows, cols;
+  if (fread(&rows, sizeof(int), 1, f) != 1 ||
+      fread(&cols, sizeof(int), 1, f) != 1)
+  {
+    fprintf(stderr, "read_matrix: unexpected EOF\n");
+    exit(1);
+  }
+  Matrix *m = matrix_alloc(rows, cols);
+  read_floats(f, m->data, rows * cols);
+  return m;
+}
+
+void save_model(const TransformerModel *model, const Vocabulary *vocab,
+                const char *path)
+{
+  FILE *f = fopen(path, "wb");
+  if (!f) { perror(path); exit(1); }
+
+  fwrite(&model->vocab_size,    sizeof(int), 1, f);
+  fwrite(&model->d_model,       sizeof(int), 1, f);
+  fwrite(&model->num_layers,    sizeof(int), 1, f);
+  fwrite(&model->num_heads,     sizeof(int), 1, f);
+  fwrite(&model->ffn_hidden_dim, sizeof(int), 1, f);
+
+  // vocab chars
+  fwrite(vocab->chars, sizeof(char), model->vocab_size, f);
+
+  // embedding table
+  write_matrix(f, model->embedding_table);
+
+  // per-layer weights
+  for (int l = 0; l < model->num_layers; l++)
+  {
+    write_matrix(f, model->W_Q_layers[l]);
+    write_matrix(f, model->W_K_layers[l]);
+    write_matrix(f, model->W_V_layers[l]);
+    write_matrix(f, model->W_O_layers[l]);
+    write_matrix(f, model->W1_layers[l]);
+    write_matrix(f, model->b1_layers[l]);
+    write_matrix(f, model->W2_layers[l]);
+    write_matrix(f, model->b2_layers[l]);
+    write_floats(f, model->ln1_gain_layers[l], model->d_model);
+    write_floats(f, model->ln1_bias_layers[l], model->d_model);
+    write_floats(f, model->ln2_gain_layers[l], model->d_model);
+    write_floats(f, model->ln2_bias_layers[l], model->d_model);
+  }
+
+  // output projection
+  write_matrix(f, model->W_out);
+  write_matrix(f, model->b_out);
+
+  fclose(f);
+  printf("Model saved to '%s'\n", path);
+}
+
+// Returns the loaded model AND fills out a fresh Vocabulary built from the
+// chars stored in the checkpoint file.
+TransformerModel *load_model(const char *path, Vocabulary **vocab_out)
+{
+  FILE *f = fopen(path, "rb");
+  if (!f) { perror(path); exit(1); }
+
+  int vocab_size, d_model, num_layers, num_heads, ffn_hidden_dim;
+  if (fread(&vocab_size,     sizeof(int), 1, f) != 1 ||
+      fread(&d_model,        sizeof(int), 1, f) != 1 ||
+      fread(&num_layers,     sizeof(int), 1, f) != 1 ||
+      fread(&num_heads,      sizeof(int), 1, f) != 1 ||
+      fread(&ffn_hidden_dim, sizeof(int), 1, f) != 1)
+  {
+    fprintf(stderr, "load_model: bad header\n");
+    exit(1);
+  }
+
+  // rebuild vocabulary from the stored chars
+  Vocabulary *vocab = malloc(sizeof(Vocabulary));
+  memset(vocab->char_to_id, -1, sizeof(vocab->char_to_id));
+  vocab->vocab_size = vocab_size;
+  vocab->chars = malloc(vocab_size + 1);
+  if (fread(vocab->chars, sizeof(char), vocab_size, f) != (size_t)vocab_size)
+  {
+    fprintf(stderr, "load_model: failed to read vocab chars\n");
+    exit(1);
+  }
+  vocab->chars[vocab_size] = '\0';
+  for (int i = 0; i < vocab_size; i++)
+    vocab->char_to_id[(unsigned char)vocab->chars[i]] = i;
+
+  TransformerModel *model = init_model(vocab_size, d_model, num_layers, num_heads);
+  // Overwrite weights that init_model randomised
+
+  // embedding table
+  Matrix *emb = read_matrix(f);
+  memcpy(model->embedding_table->data, emb->data,
+         emb->rows * emb->cols * sizeof(float));
+  matrix_free(emb);
+
+  // per-layer
+  for (int l = 0; l < num_layers; l++)
+  {
+    Matrix *tmp;
+#define LOAD_MATRIX(dst) tmp = read_matrix(f); memcpy((dst)->data, tmp->data, tmp->rows*tmp->cols*sizeof(float)); matrix_free(tmp)
+    LOAD_MATRIX(model->W_Q_layers[l]);
+    LOAD_MATRIX(model->W_K_layers[l]);
+    LOAD_MATRIX(model->W_V_layers[l]);
+    LOAD_MATRIX(model->W_O_layers[l]);
+    LOAD_MATRIX(model->W1_layers[l]);
+    LOAD_MATRIX(model->b1_layers[l]);
+    LOAD_MATRIX(model->W2_layers[l]);
+    LOAD_MATRIX(model->b2_layers[l]);
+#undef LOAD_MATRIX
+    read_floats(f, model->ln1_gain_layers[l], d_model);
+    read_floats(f, model->ln1_bias_layers[l], d_model);
+    read_floats(f, model->ln2_gain_layers[l], d_model);
+    read_floats(f, model->ln2_bias_layers[l], d_model);
+  }
+
+  Matrix *tmp;
+#define LOAD_MATRIX(dst) tmp = read_matrix(f); memcpy((dst)->data, tmp->data, tmp->rows*tmp->cols*sizeof(float)); matrix_free(tmp)
+  LOAD_MATRIX(model->W_out);
+  LOAD_MATRIX(model->b_out);
+#undef LOAD_MATRIX
+
+  fclose(f);
+  printf("Model loaded from '%s'  (vocab=%d d_model=%d layers=%d heads=%d)\n",
+         path, vocab_size, d_model, num_layers, num_heads);
+  if (vocab_out) *vocab_out = vocab;
+  return model;
+}
+
+// ── Adam Optimizer ────────────────────────────────────────────────────────────
+
+AdamState *init_adam_state(TransformerModel *model)
+{
+  AdamState *state = malloc(sizeof(AdamState));
+  
+  state->m_embedding_table = matrix_alloc(model->embedding_table->rows, model->embedding_table->cols);
+  state->v_embedding_table = matrix_alloc(model->embedding_table->rows, model->embedding_table->cols);
+
+  int nl = model->num_layers;
+  state->m_W_Q_layers = malloc(nl * sizeof(Matrix *)); state->v_W_Q_layers = malloc(nl * sizeof(Matrix *));
+  state->m_W_K_layers = malloc(nl * sizeof(Matrix *)); state->v_W_K_layers = malloc(nl * sizeof(Matrix *));
+  state->m_W_V_layers = malloc(nl * sizeof(Matrix *)); state->v_W_V_layers = malloc(nl * sizeof(Matrix *));
+  state->m_W_O_layers = malloc(nl * sizeof(Matrix *)); state->v_W_O_layers = malloc(nl * sizeof(Matrix *));
+  state->m_W1_layers = malloc(nl * sizeof(Matrix *));  state->v_W1_layers = malloc(nl * sizeof(Matrix *));
+  state->m_b1_layers = malloc(nl * sizeof(Matrix *));  state->v_b1_layers = malloc(nl * sizeof(Matrix *));
+  state->m_W2_layers = malloc(nl * sizeof(Matrix *));  state->v_W2_layers = malloc(nl * sizeof(Matrix *));
+  state->m_b2_layers = malloc(nl * sizeof(Matrix *));  state->v_b2_layers = malloc(nl * sizeof(Matrix *));
+  
+  state->m_ln1_gain_layers = malloc(nl * sizeof(float *)); state->v_ln1_gain_layers = malloc(nl * sizeof(float *));
+  state->m_ln1_bias_layers = malloc(nl * sizeof(float *)); state->v_ln1_bias_layers = malloc(nl * sizeof(float *));
+  state->m_ln2_gain_layers = malloc(nl * sizeof(float *)); state->v_ln2_gain_layers = malloc(nl * sizeof(float *));
+  state->m_ln2_bias_layers = malloc(nl * sizeof(float *)); state->v_ln2_bias_layers = malloc(nl * sizeof(float *));
+
+  for (int i = 0; i < nl; i++)
+  {
+    state->m_W_Q_layers[i] = matrix_alloc(model->d_model, model->d_model); state->v_W_Q_layers[i] = matrix_alloc(model->d_model, model->d_model);
+    state->m_W_K_layers[i] = matrix_alloc(model->d_model, model->d_model); state->v_W_K_layers[i] = matrix_alloc(model->d_model, model->d_model);
+    state->m_W_V_layers[i] = matrix_alloc(model->d_model, model->d_model); state->v_W_V_layers[i] = matrix_alloc(model->d_model, model->d_model);
+    state->m_W_O_layers[i] = matrix_alloc(model->d_model, model->d_model); state->v_W_O_layers[i] = matrix_alloc(model->d_model, model->d_model);
+    
+    state->m_W1_layers[i] = matrix_alloc(model->d_model, model->ffn_hidden_dim); state->v_W1_layers[i] = matrix_alloc(model->d_model, model->ffn_hidden_dim);
+    state->m_b1_layers[i] = matrix_alloc(1, model->ffn_hidden_dim);              state->v_b1_layers[i] = matrix_alloc(1, model->ffn_hidden_dim);
+    state->m_W2_layers[i] = matrix_alloc(model->ffn_hidden_dim, model->d_model); state->v_W2_layers[i] = matrix_alloc(model->ffn_hidden_dim, model->d_model);
+    state->m_b2_layers[i] = matrix_alloc(1, model->d_model);                     state->v_b2_layers[i] = matrix_alloc(1, model->d_model);
+    
+    state->m_ln1_gain_layers[i] = calloc(model->d_model, sizeof(float)); state->v_ln1_gain_layers[i] = calloc(model->d_model, sizeof(float));
+    state->m_ln1_bias_layers[i] = calloc(model->d_model, sizeof(float)); state->v_ln1_bias_layers[i] = calloc(model->d_model, sizeof(float));
+    state->m_ln2_gain_layers[i] = calloc(model->d_model, sizeof(float)); state->v_ln2_gain_layers[i] = calloc(model->d_model, sizeof(float));
+    state->m_ln2_bias_layers[i] = calloc(model->d_model, sizeof(float)); state->v_ln2_bias_layers[i] = calloc(model->d_model, sizeof(float));
+  }
+
+  state->m_W_out = matrix_alloc(model->d_model, model->vocab_size);
+  state->v_W_out = matrix_alloc(model->d_model, model->vocab_size);
+  state->m_b_out = matrix_alloc(1, model->vocab_size);
+  state->v_b_out = matrix_alloc(1, model->vocab_size);
+
+  return state;
+}
+
+void free_adam_state(AdamState *state, int num_layers)
+{
+  matrix_free(state->m_embedding_table); matrix_free(state->v_embedding_table);
+  matrix_free(state->m_W_out); matrix_free(state->v_W_out);
+  matrix_free(state->m_b_out); matrix_free(state->v_b_out);
+  for (int i = 0; i < num_layers; i++) {
+    matrix_free(state->m_W_Q_layers[i]); matrix_free(state->v_W_Q_layers[i]);
+    matrix_free(state->m_W_K_layers[i]); matrix_free(state->v_W_K_layers[i]);
+    matrix_free(state->m_W_V_layers[i]); matrix_free(state->v_W_V_layers[i]);
+    matrix_free(state->m_W_O_layers[i]); matrix_free(state->v_W_O_layers[i]);
+    matrix_free(state->m_W1_layers[i]);  matrix_free(state->v_W1_layers[i]);
+    matrix_free(state->m_b1_layers[i]);  matrix_free(state->v_b1_layers[i]);
+    matrix_free(state->m_W2_layers[i]);  matrix_free(state->v_W2_layers[i]);
+    matrix_free(state->m_b2_layers[i]);  matrix_free(state->v_b2_layers[i]);
+    free(state->m_ln1_gain_layers[i]); free(state->v_ln1_gain_layers[i]);
+    free(state->m_ln1_bias_layers[i]); free(state->v_ln1_bias_layers[i]);
+    free(state->m_ln2_gain_layers[i]); free(state->v_ln2_gain_layers[i]);
+    free(state->m_ln2_bias_layers[i]); free(state->v_ln2_bias_layers[i]);
+  }
+  free(state->m_W_Q_layers); free(state->v_W_Q_layers);
+  free(state->m_W_K_layers); free(state->v_W_K_layers);
+  free(state->m_W_V_layers); free(state->v_W_V_layers);
+  free(state->m_W_O_layers); free(state->v_W_O_layers);
+  free(state->m_W1_layers);  free(state->v_W1_layers);
+  free(state->m_b1_layers);  free(state->v_b1_layers);
+  free(state->m_W2_layers);  free(state->v_W2_layers);
+  free(state->m_b2_layers);  free(state->v_b2_layers);
+  free(state->m_ln1_gain_layers); free(state->v_ln1_gain_layers);
+  free(state->m_ln1_bias_layers); free(state->v_ln1_bias_layers);
+  free(state->m_ln2_gain_layers); free(state->v_ln2_gain_layers);
+  free(state->m_ln2_bias_layers); free(state->v_ln2_bias_layers);
+  free(state);
+}
+
+void adam_update_matrix(Matrix *weight, Matrix *grad, Matrix *m, Matrix *v, float lr, int t)
+{
+  float beta1 = 0.9f;
+  float beta2 = 0.999f;
+  float epsilon = 1e-8f;
+  float correction1 = 1.0f - powf(beta1, t);
+  float correction2 = 1.0f - powf(beta2, t);
+
+  for (int i = 0; i < weight->capacity; i++)
+  {
+    float g = grad->data[i];
+    m->data[i] = beta1 * m->data[i] + (1.0f - beta1) * g;
+    v->data[i] = beta2 * v->data[i] + (1.0f - beta2) * g * g;
+
+    float m_hat = m->data[i] / correction1;
+    float v_hat = v->data[i] / correction2;
+
+    weight->data[i] -= lr * m_hat / (sqrtf(v_hat) + epsilon);
+  }
+}
+
+void adam_update_float(float *weight, float *grad, float *m, float *v, int size, float lr, int t)
+{
+  float beta1 = 0.9f;
+  float beta2 = 0.999f;
+  float epsilon = 1e-8f;
+  float correction1 = 1.0f - powf(beta1, t);
+  float correction2 = 1.0f - powf(beta2, t);
+
+  for (int i = 0; i < size; i++)
+  {
+    float g = grad[i];
+    m[i] = beta1 * m[i] + (1.0f - beta1) * g;
+    v[i] = beta2 * v[i] + (1.0f - beta2) * g * g;
+
+    float m_hat = m[i] / correction1;
+    float v_hat = v[i] / correction2;
+
+    weight[i] -= lr * m_hat / (sqrtf(v_hat) + epsilon);
+  }
+}
+

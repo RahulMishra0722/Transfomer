@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
-LDFLAGS = -lm
+LDFLAGS = -lm -framework Accelerate
 
 OBJS = main.o math_ops.o transformer.o
 

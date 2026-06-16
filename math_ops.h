@@ -2,9 +2,10 @@
 #define MATH_OPS_H
 typedef struct
 {
+  float *input;      // Original input (saved for backward pass)
+  float *normalized; // The normalized values (before gain/bias)
   float mean;
   float variance;
-  float *normalized; // The normalized values (before gain/bias)
   int size;
 } LayerNormCache;
 typedef struct

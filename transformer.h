@@ -2,6 +2,24 @@
 #define TRANSFORMER_H
 
 #include "math_ops.h" // Include math_ops since we use Matrix
+
+typedef struct
+{
+  Matrix *input;
+  Matrix *result;
+  Matrix *concat_result;
+  Matrix **head_outputs;
+  Matrix **head_scores;
+  Matrix **Q_heads;
+  Matrix **K_heads;
+  Matrix **V_heads;
+  Matrix *Q;
+  Matrix *K;
+  Matrix *V;
+  int num_of_heads;
+  int head_dim;
+} MultiHeadAttentionCache;
+
 typedef struct
 {
     // ADD THIS:
@@ -34,14 +52,6 @@ typedef struct
     int vocab_size;
     int char_to_id[256];
 } Vocabulary;
-typedef struct
-{
-    float *input; // ADD THIS - save original input
-    float *normalized;
-    float mean;
-    float variance;
-    int size;
-} LayerNormCache;
 
 typedef struct
 {
@@ -59,9 +69,24 @@ char *detokenize(int *token_ids, int length, Vocabulary *vocab);
 void add_positional_encoding(Matrix *embeddings, int seq_len, int d_model);
 void add_bias(Matrix *matrix, Matrix *bias, Matrix *result);
 void feed_forward(Matrix *input, Matrix *W1, Matrix *b1, Matrix *W2, Matrix *b2, Matrix *output, Matrix *hidden_post_gelu, Matrix *hidden_pre_gelu);
-AttentionOutput *masked_attention(Matrix *Q, Matrix *K, Matrix *V);
+AttentionOutput masked_attention(Matrix *Q, Matrix *K, Matrix *V);
 MultiHeadAttentionCache multi_head_masked_attention(Matrix *input, Matrix *W_Q, Matrix *W_K, Matrix *W_V, Matrix *W_0, int num_of_heads);
 Matrix *embed_tokens(int *token_ids, int seq_len, Matrix *embedding_table);
+
+float cross_entropy_loss(Matrix *logist, int *target_token, int seq_len, int vocab_size);
+void feed_forward_backward(
+    Matrix *d_output,         
+    Matrix *input,            
+    Matrix *hidden_pre_gelu,  
+    Matrix *hidden_post_gelu, 
+    Matrix *W1,
+    Matrix *W2,
+    Matrix *d_input, 
+    Matrix *d_W1,    
+    Matrix *d_b1,    
+    Matrix *d_W2,    
+    Matrix *d_b2     
+);
 
 // Encoder and decoder
 DecoderLayerCache decoder_layer(
@@ -160,9 +185,8 @@ float train_step(
 
     // Training hyperparameter
     float learning_rate);
-update_weights(Matrix *weights, Matrix *gradients, float learning_rate)
-{
-}
+void adam_update_matrix(Matrix *weight, Matrix *grad, Matrix *m, Matrix *v, float lr, int t);
+void adam_update_float(float *weight, float *grad, float *m, float *v, int size, float lr, int t);
 void decoder_layer_backward(
     Matrix *dOutput,
 
@@ -200,5 +224,65 @@ Matrix *create_embedding_table(int vocab_size, int d_model);
 // In transformer.h
 
 Matrix *output_projection(Matrix *decoder_output, Matrix *W_out, Matrix *b_out);
-int sample_token(Matrix *logits, int vocab_size);
+int sample_token(Matrix *logits, int vocab_size, float temperature);
+
+// Model lifecycle
+typedef struct
+{
+  int vocab_size;
+  int d_model;
+  int num_layers;
+  int num_heads;
+  int ffn_hidden_dim;
+  Matrix *embedding_table;
+  Matrix **W_Q_layers;
+  Matrix **W_K_layers;
+  Matrix **W_V_layers;
+  Matrix **W_O_layers;
+  Matrix **W1_layers;
+  Matrix **b1_layers;
+  Matrix **W2_layers;
+  Matrix **b2_layers;
+  float **ln1_gain_layers;
+  float **ln1_bias_layers;
+  float **ln2_gain_layers;
+  float **ln2_bias_layers;
+  Matrix *W_out;
+  Matrix *b_out;
+} TransformerModel;
+
+typedef struct
+{
+  Matrix *m_embedding_table;
+  Matrix *v_embedding_table;
+  Matrix **m_W_Q_layers; Matrix **v_W_Q_layers;
+  Matrix **m_W_K_layers; Matrix **v_W_K_layers;
+  Matrix **m_W_V_layers; Matrix **v_W_V_layers;
+  Matrix **m_W_O_layers; Matrix **v_W_O_layers;
+  Matrix **m_W1_layers;  Matrix **v_W1_layers;
+  Matrix **m_b1_layers;  Matrix **v_b1_layers;
+  Matrix **m_W2_layers;  Matrix **v_W2_layers;
+  Matrix **m_b2_layers;  Matrix **v_b2_layers;
+  float **m_ln1_gain_layers; float **v_ln1_gain_layers;
+  float **m_ln1_bias_layers; float **v_ln1_bias_layers;
+  float **m_ln2_gain_layers; float **v_ln2_gain_layers;
+  float **m_ln2_bias_layers; float **v_ln2_bias_layers;
+  Matrix *m_W_out;
+  Matrix *v_W_out;
+  Matrix *m_b_out;
+  Matrix *v_b_out;
+} AdamState;
+
+AdamState *init_adam_state(TransformerModel *model);
+void free_adam_state(AdamState *state, int num_layers);
+
+TransformerModel *init_model(int vocab_size, int d_model, int num_layers, int num_heads);
+char *generate(TransformerModel *model, Vocabulary *vocab, char *prompt, int max_len, int context_len);
+float train_step_with_gradients(TransformerModel *model, Vocabulary *vocab, int *input_tokens, int *target_tokens, int seq_len, float learning_rate, AdamState *adam_state, int step);
+void embedding_backward(Matrix *d_embeddings, int *token_ids, int seq_len, Matrix *d_embedding_table);
+
+// Weight persistence
+void save_model(const TransformerModel *model, const Vocabulary *vocab, const char *path);
+TransformerModel *load_model(const char *path, Vocabulary **vocab_out);
+
 #endif // TRANSFORMER_H

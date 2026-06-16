@@ -1,0 +1,4 @@
+(lldb) target create "./transformer"
+Current executable set to '/Users/rahul07/transformers/transformer' (arm64).
+(lldb) run
+error: process exited with status -1 (attach failed (Not allowed to attach to process.  Look in the console messages (Console.app), near the debugserver entries, when the attach failed.  The subsystem that denied the attach permission will likely have logged an informative message about why it was denied.))

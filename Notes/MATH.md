@@ -1,0 +1,4 @@
+# Lets Get The Math Straight
+
+Before we understand anything we must know what a derivative is.
+Derivative is the rate at which something is changing at any given instant and i didnt think that hard when first hearing about the problem but now that i did and given im less ignorant then before i realised there can be no change in an instant its oxymornic to say instantanious rate of change because change requires you to have a before and after and so we have to get our lingo straigt we arent talking about specifically instant but how something is changing as it approches 0 which can also be thought of as making the time interval very very small and seeing how the speed is changing and we also have limits so as we make this time window smaller and smaller we see a number that appears which are sloly converging towards before it becomes/ reaches 0
